@@ -1,13 +1,10 @@
-import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
 import docx
 import PyPDF2
+import os
 
-# === Укажите ваш токен от BotFather ===
-TOKEN = "8330847005:AAEmWHaLmGnq3dLBpcBU5P7fDBuc4jgDecA"
 
-# --- Проверка DOCX ---
 def check_docx(file_path):
     doc = docx.Document(file_path)
     text = "\n".join([p.text for p in doc.paragraphs])
@@ -19,11 +16,11 @@ def check_docx(file_path):
             result.append(f"❌ {section} — отсутствует")
     return "\n".join(result)
 
-# --- Проверка PDF ---
+
 def check_pdf(file_path):
+    text = ""
     with open(file_path, "rb") as f:
         reader = PyPDF2.PdfReader(f)
-        text = ""
         for page in reader.pages:
             text += page.extract_text() or ""
     result = []
@@ -34,34 +31,63 @@ def check_pdf(file_path):
             result.append(f"❌ {section} — отсутствует")
     return "\n".join(result)
 
-# --- Стартовая команда ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Отправь мне файл (.docx или .pdf), и я проверю его структуру 📑")
 
-# --- Обработка документов ---
-async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file = await update.message.document.get_file()
-    file_path = update.message.document.file_name
-    await file.download_to_drive(file_path)
+def choose_file():
+    file_path = filedialog.askopenfilename(
+        title="Выберите документ",
+        filetypes=[("Документы Word", "*.docx"), ("PDF файлы", "*.pdf")]
+    )
 
-    if file_path.endswith(".docx"):
-        report = check_docx(file_path)
-    elif file_path.endswith(".pdf"):
-        report = check_pdf(file_path)
-    else:
-        report = "❌ Поддерживаются только .docx и .pdf"
+    if not file_path:
+        return
 
-    os.remove(file_path)
-    await update.message.reply_text(report)
+    result_text.delete(1.0, tk.END)
 
-# --- Запуск бота ---
-def main():
-    app = Application.builder().token(TOKEN).build()
+    try:
+        if file_path.endswith(".docx"):
+            result = check_docx(file_path)
+        elif file_path.endswith(".pdf"):
+            result = check_pdf(file_path)
+        else:
+            messagebox.showerror("Ошибка", "Поддерживаются только .docx и .pdf файлы.")
+            return
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_docs))
+        # Показ результатов
+        result_text.insert(tk.END, f"📄 Файл: {os.path.basename(file_path)}\n\n")
+        result_text.insert(tk.END, result)
 
-    app.run_polling()
+    except Exception as e:
+        messagebox.showerror("Ошибка при проверке", str(e))
 
-if __name__ == "__main__":
-    main()
+
+# === Интерфейс ===
+root = tk.Tk()
+root.title("Проверка структуры документа")
+root.geometry("500x400")
+root.resizable(True, True)
+
+frame = tk.Frame(root, padx=10, pady=10)
+frame.pack(fill="both", expand=True)
+
+label = tk.Label(frame, text="Проверка структуры документа", font=("Segoe UI", 14, "bold"))
+label.pack(pady=10)
+
+button = tk.Button(frame, text="Выбрать файл", command=choose_file, font=("Segoe UI", 12))
+button.pack(pady=5)
+
+result_text = scrolledtext.ScrolledText(frame, wrap=tk.WORD, width=60, height=15, font=("Segoe UI", 10))
+result_text.pack(pady=10)
+
+# === Приветственное сообщение ===
+welcome_message = (
+    "💬 Добро пожаловать!\n\n"
+    "Выберите файл (.docx или .pdf) для проверки структуры.\n"
+    "Программа определит наличие разделов:\n"
+    "• Введение\n"
+    "• Заключение\n"
+    "• Список литературы\n\n"
+    "Нажмите кнопку «Выбрать файл» 👇"
+)
+result_text.insert(tk.END, welcome_message)
+
+root.mainloop()
