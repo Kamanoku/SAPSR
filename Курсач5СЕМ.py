@@ -1,4 +1,4 @@
-﻿import tkinter as tk
+import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 import docx
 import PyPDF2
@@ -265,61 +265,135 @@ class DocumentChecker:
             # если неизвестный тип — считаем валидным, но можно поменять на False
             return True
 
-    def _find_value_by_anchor_in_paragraphs(self, anchor: str, doc_paragraphs: list) -> (bool, str):
+    def _find_value_by_anchor_in_paragraphs(self, anchor: str, doc_paragraphs: list, expected_type: str = None) -> (bool, str):
         """
-        Улучшенный поиск значений: более точное сопоставление с anchor
+        Улучшенный поиск значений по anchor.
+
+        Логика:
+        1. Если anchor пуст — вернуть (False, None).
+        2. Нормализуем anchor (убираем мн. пробелы, приводим к lower).
+        3. Ищем в параграфах:
+           - сначала — параграфы, где anchor встречается как отдельное слово (word boundary).
+             Среди таких вхождений отдаём приоритет тем, где:
+               a) после anchor в той же строке есть текст (и это короткий текст / число / дата),
+               b) или параграф начинается с anchor (например "Курс:"), тогда смотрим текст после anchor.
+           - если таких нет — берём следующий непустой параграф после параграфа с anchor,
+             но проверяем на соответствие expected_type (если указан).
+        4. Если найдено несколько кандидатов, выбираем наиболее подходящий (например, где value соответствует expected_type,
+           или где value короче 40 символов).
         """
         if not anchor:
             return False, None
-    
-        anchor_norm = re.sub(r'\s+', ' ', anchor.strip().lower())
-    
+
+        # нормализуем anchor для поиска
+        anchor_norm = re.sub(r'\s+', ' ', anchor.strip())
+        anchor_escaped = re.escape(anchor_norm)
+        # собираем паттерн для "как отдельное слово" — добавляем границы \b, но для Unicode нам пригодится
+        # использовать (?<!\w) и (?!\w) — чтобы работать с кириллицей корректно
+        word_pat = re.compile(r"(?<!\w)" + anchor_escaped + r"(?!\w)", flags=re.IGNORECASE)
+
+        candidates = []  # tuples (priority, para_index, value_candidate, reason)
+
         for i, para in enumerate(doc_paragraphs):
             if not para:
                 continue
-        
-            para_norm = re.sub(r'\s+', ' ', para.strip().lower())
-        
-            # Ищем точное вхождение anchor (игнор регистра, но с учетом всей строки)
-            if anchor_norm in para_norm:
-                # Найдем позицию anchor в оригинальном параграфе (не нормализованном)
+            para_norm = re.sub(r'\s+', ' ', para.strip())
+
+            # 1) ищем anchor как отдельное слово
+            for m in word_pat.finditer(para_norm):
+                # position в нормализованном параграфе
+                start_pos = m.start()
+                end_pos = m.end()
+
+                # получим часть параграфа после anchor (оригинальную, не нормализованную)
+                # найдём соответствующую позицию в оригинальном параграфе
                 para_original = doc_paragraphs[i]
-                idx = para_norm.find(anchor_norm)
-                
-                if idx == -1:
-                    continue
-                
-                # Вычисляем позицию в оригинальной строке
-                # Это приблизительно, но должно работать в большинстве случаев
-                original_idx = 0
-                norm_idx = 0
-                while norm_idx < idx and original_idx < len(para_original):
-                    if para_original[original_idx].isspace():
-                        # Пропускаем пробелы в оригинальной строке
-                        original_idx += 1
-                        # В нормализованной строке все множественные пробелы заменены на один
-                        if norm_idx < len(para_norm) and para_norm[norm_idx] == ' ':
-                            norm_idx += 1
-                    else:
-                        original_idx += 1
-                        norm_idx += 1
-                
-                # Проверим, есть ли текст после anchor в том же параграфе
-                text_after_anchor = para_original[original_idx + len(anchor):].strip()
-                
-                if text_after_anchor:
-                    # Если есть текст после anchor в том же параграфе, используем его
-                    return True, text_after_anchor
+                # простая эвристика: найдём первое вхождение anchor_norm (case-insensitive) в оригинале
+                idx_orig = para_original.lower().find(anchor_norm.lower())
+                if idx_orig != -1:
+                    after = para_original[idx_orig + len(anchor_norm):].strip()
                 else:
-                    # Ищем следующий непустой параграф
-                    for j in range(i + 1, len(doc_paragraphs)):
-                        next_para = doc_paragraphs[j].strip()
-                        if next_para and not next_para.lower().startswith(anchor_norm):
-                            return True, next_para
-                
-                return False, None
-    
+                    after = para_original[end_pos:].strip()  # fallback
+
+                # Оцениваем кандидатуру:
+                # Если есть текст сразу после anchor в том же параграфе — это хороший кандидат.
+                if after:
+                    # приоритет выше, если:
+                    # - параграф начинается с anchor (anchor в начале) OR
+                    # - текст после anchor короткий (<=40) OR соответствует expected_type
+                    starts_with = para_norm.lower().startswith(anchor_norm.lower())
+                    length_score = 0 if len(after) <= 40 else 1
+                    type_matches = False
+                    if expected_type:
+                        type_matches = self._validate_type(after, expected_type)
+                    priority = 10  # базовый
+                    if starts_with:
+                        priority -= 4
+                    if type_matches:
+                        priority -= 3
+                    if length_score == 1:
+                        priority += 1
+                    candidates.append((priority, i, after, f"same_para (after)"))
+                else:
+                    # если после anchor нет текста в той же строке — возможный кандидат: следующий непустой параграф
+                    # оценим его ниже
+                    # пометим как потенциальный и обработаем дальше
+                    # priority выше, если expected_type matches next paragraph
+                    next_val = None
+                    for j in range(i+1, len(doc_paragraphs)):
+                        nxt = doc_paragraphs[j].strip()
+                        if not nxt:
+                            continue
+                        # не брать следующий параграф, если он повторяет сам anchor (зацикливание)
+                        if anchor_norm.lower() == re.sub(r'\s+', ' ', nxt.lower()):
+                            continue
+                        next_val = nxt
+                        break
+                    if next_val:
+                        type_matches = False
+                        if expected_type:
+                            type_matches = self._validate_type(next_val, expected_type)
+                        priority = 14
+                        if type_matches:
+                            priority -= 5
+                        # если следующий параграф короткий — лучше
+                        if len(next_val) <= 40:
+                            priority -= 1
+                        candidates.append((priority, i+1, next_val, f"next_para"))
+
+        # Если нашли кандидатов — выбираем минимальный priority (лучший)
+        if candidates:
+            candidates.sort(key=lambda x: (x[0], x[1]))  # сначала priority, затем порядковый номер
+            best = candidates[0]
+            return True, best[2]
+
+        # Если не нашли, попытаться ещё раз более ленно: искать anchor как substring (fallback),
+        # но только если anchor длинный (>3) — чтобы не ловить короткие слова везде.
+        if len(anchor_norm) > 3:
+            for i, para in enumerate(doc_paragraphs):
+                if not para:
+                    continue
+                para_norm = re.sub(r'\s+', ' ', para.strip())
+                if anchor_norm.lower() in para_norm.lower():
+                    # попробуем взять текст после первого вхождения
+                    idx = para_norm.lower().find(anchor_norm.lower())
+                    para_original = doc_paragraphs[i]
+                    idx_orig = para_original.lower().find(anchor_norm.lower())
+                    after = para_original[idx_orig + len(anchor_norm):].strip() if idx_orig != -1 else ""
+                    if after:
+                        if expected_type is None or self._validate_type(after, expected_type):
+                            return True, after
+                    # else попробовать следующий параграф
+                    for j in range(i+1, len(doc_paragraphs)):
+                        nxt = doc_paragraphs[j].strip()
+                        if nxt:
+                            if expected_type is None or self._validate_type(nxt, expected_type):
+                                return True, nxt
+                            else:
+                                break
+
         return False, None
+
 
     def check_document(self, doc_paragraphs: list) -> list:
         """
@@ -334,7 +408,7 @@ class DocumentChecker:
             optional = ph["optional"]
             anchor = ph.get("anchor", "").strip()
 
-            found, value = self._find_value_by_anchor_in_paragraphs(anchor, doc_paragraphs)
+            found, value = self._find_value_by_anchor_in_paragraphs(anchor, doc_paragraphs, expected_type=expected_type)
             if not found:
                 if optional:
                     results.append({"field": name, "status": "missing_optional", "optional": True})
