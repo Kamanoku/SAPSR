@@ -449,7 +449,6 @@ def main():
 
     queue = OrderedDict(sets)
     counter = 1
-    
     processed_pairs = set()
 
     while queue:
@@ -464,35 +463,31 @@ def main():
             
             processed_pairs.add((set_name, rule_str))
 
+            if set_name != antecedent:
+                continue
+
             print(f"\n{'='*60}")
             print(f"ВЫЧИСЛЕНИЕ: {set_name} ● ({rule_str})")
             print(f"{'='*60}")
             
-            if set_name == antecedent:
-                result_name = consequent + "'"
-            else:
-                result_name = set_name + "'"
-            
+            result_name = consequent + "'"
+
             inferrence = map_algebra.composition(
-                a, rule, verbose=True, 
-                set_name_a=set_name, 
+                a, rule, verbose=True,
+                set_name_a=set_name,
                 set_name_b=result_name
             )
-            
-            inferrence_name = None
+
             for n, s in sets.items():
                 if inferrence == s:
-                    inferrence_name = n
+                    print(f"\nРЕЗУЛЬТАТ: {set_name} ● ({rule_str}) => {n} = {s}")
                     break
-            
-            if inferrence_name is None:
-                inferrence_name = f'I{counter}'
+            else:
+                inferrence_name = f"I{counter}"
                 counter += 1
                 queue[inferrence_name] = inferrence
                 sets[inferrence_name] = inferrence
-            
-            print(f"\nРЕЗУЛЬТАТ: {set_name} ● ({rule_str}) => {inferrence_name} = {sets[inferrence_name]}")
-
+                print(f"\nРЕЗУЛЬТАТ: {set_name} ● ({rule_str}) => {inferrence_name} = {inferrence}")
 
 if __name__ == '__main__':
     main()
