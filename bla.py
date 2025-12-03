@@ -9,7 +9,7 @@ from datetime import datetime
 
 
 # ============================================================
-#  DocumentLoader
+#  DocumentLoader (МОДИФИЦИРОВАН)
 # ============================================================
 class DocumentLoader:
     """Загружает текст и параграфы из .docx и .pdf файлов."""
@@ -18,37 +18,33 @@ class DocumentLoader:
     def _normalize_text(s: str) -> str:
         if s is None:
             return ""
+        # Удаляем лишние символы, сжимаем пробелы и удаляем переводы строк/табуляцию
         s = s.replace("\u00A0", " ").replace("\u200B", "").replace("\uFEFF", "")
+        # ИСПРАВЛЕНИЕ: Удаление символов перевода строки и табуляции
+        s = s.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
         s = re.sub(r"[ \t\v\f\u00A0]+", " ", s)
         return s.strip()
 
-    # ---------- обновлённые функции ----------
     @staticmethod
     def load_docx_text_and_paragraphs(path: str, dedupe: bool = True, preserve_empty: bool = False):
-        """
-        Загружает параграфы из .docx.
-        - dedupe=True : убирает точные дубликаты (старое поведение)
-        - preserve_empty=True : сохраняет пустые параграфы как "" (по умолчанию их удаляем)
-        """
         doc = docx.Document(path)
         paragraphs = []
         seen = set()
 
         def add_para(text):
-            if text is None:
-                text = ""
+            if text is None: text = ""
             t_norm = DocumentLoader._normalize_text(text) if text else ""
-            if t_norm == "" and not preserve_empty:
-                return
+            if t_norm == "" and not preserve_empty: return
+
             if dedupe:
-                if t_norm and t_norm not in seen:
-                    paragraphs.append(t_norm)
-                    seen.add(t_norm)
-                elif t_norm == "" and preserve_empty:
+                if t_norm:
+                    if t_norm not in seen:
+                        paragraphs.append(t_norm)
+                        seen.add(t_norm)
+                elif preserve_empty:
                     paragraphs.append(t_norm)
             else:
-                if t_norm == "" and not preserve_empty:
-                    return
+                if t_norm == "" and not preserve_empty: return
                 paragraphs.append(t_norm)
 
         for p in doc.paragraphs:
@@ -67,10 +63,6 @@ class DocumentLoader:
 
     @staticmethod
     def load_pdf_text_and_paragraphs(path: str, dedupe: bool = True, preserve_empty: bool = False):
-        """
-        Загружает строки/параграфы из PDF.
-        PyPDF2.extract_text возвращает текст страницы — разбиваем по строкам.
-        """
         text_lines = []
         seen = set()
 
@@ -80,17 +72,18 @@ class DocumentLoader:
                 page_text = page.extract_text() or ""
                 for ln in page_text.splitlines():
                     ln_norm = DocumentLoader._normalize_text(ln)
-                    if ln_norm == "" and not preserve_empty:
-                        continue
+
+                    if ln_norm == "" and not preserve_empty: continue
+
                     if dedupe:
-                        if ln_norm and ln_norm not in seen:
-                            text_lines.append(ln_norm)
-                            seen.add(ln_norm)
-                        elif ln_norm == "" and preserve_empty:
+                        if ln_norm:
+                            if ln_norm not in seen:
+                                text_lines.append(ln_norm)
+                                seen.add(ln_norm)
+                        elif preserve_empty:
                             text_lines.append(ln_norm)
                     else:
-                        if ln_norm == "" and not preserve_empty:
-                            continue
+                        if ln_norm == "" and not preserve_empty: continue
                         text_lines.append(ln_norm)
 
         full_text = "\n".join(text_lines)
@@ -100,7 +93,7 @@ class DocumentLoader:
     def get_paragraphs(path: str):
         lower = path.lower()
         if lower.endswith(".docx"):
-            # Для проверки документа сохраняем пустые параграфы и не удаляем дубликаты
+            # Для docx используем preserve_empty=True, чтобы не потерять пустые абзацы, которые могут быть разделителями
             _, paras = DocumentLoader.load_docx_text_and_paragraphs(path, dedupe=False, preserve_empty=True)
             return paras
         elif lower.endswith(".pdf"):
@@ -137,25 +130,20 @@ class Template:
     @staticmethod
     def extract_placeholders_from_paragraphs(paragraphs: list) -> list:
         """
-        Находит placeholders и вычисляет anchor_before и anchor_after.
-        Исправленные алгоритмы:
-        - ограничена дистанция между placeholders (max_template_distance)
-        - игнорируются параграфы, содержащие [[...]] как anchors
-        - при выборе anchor_after пропускаются служебные строки вроде "(подпись)" и т.п.
+        Находит placeholders. Поддерживает [[name:type(:group_name:group_condition)?(, optional)?]]
         """
         placeholders = []
+
         inline_pattern = re.compile(
-            r"\[\[\s*([^:\]\n]+?)\s*:\s*([^,\]\n]+?)(?:\s*,\s*(optional))?\s*\]\]",
+            r"\[\[\s*([^:\]\n]+?)\s*:\s*([^,:]\s*[^,\]\n]+?)"
+            r"(?:\s*:\s*([^:\]\n]+?)\s*:\s*([^,\]\n]+?))?"
+            r"(?:\s*,\s*(optional))?\s*\]\]",
             flags=re.IGNORECASE,
         )
 
         skip_patterns = [
-            "утверждаю",
-            "задание",
-            "введение",
-            "заключение",
-            "список использованных источников",
-            "примерный календарный график",
+            "утверждаю", "задание", "введение", "заключение",
+            "список использованных источников", "примерный календарный график",
             "подпись обучающегося",
         ]
 
@@ -166,7 +154,20 @@ class Template:
             for m in inline_pattern.finditer(para):
                 raw_name = m.group(1).strip()
                 raw_type = m.group(2).strip()
-                optional_flag = bool(m.group(3))
+                raw_group_name = m.group(3)
+                raw_group_condition = m.group(4)
+                optional_flag = m.group(5)
+
+                is_group_defined = raw_group_name is not None
+
+                if is_group_defined:
+                    raw_group_name = raw_group_name.strip() if raw_group_name else ""
+                    raw_group_condition = raw_group_condition.strip() if raw_group_condition else ""
+                else:
+                    raw_group_name = ""
+                    raw_group_condition = ""
+
+                optional_flag = bool(optional_flag)
 
                 # ---------------- anchor_before ----------------
                 left_part = para[: m.start()].strip()
@@ -177,41 +178,31 @@ class Template:
                     for j in range(idx - 1, -1, -1):
                         prev_para = paragraphs[j].strip()
                         if (
-                            prev_para
-                            and not inline_pattern.search(prev_para)
-                            and not any(sp in prev_para.lower() for sp in skip_patterns)
+                                prev_para and not inline_pattern.search(prev_para)
+                                and not any(sp in prev_para.lower() for sp in skip_patterns)
                         ):
                             anchor_before = prev_para
                             break
 
                 # ---------------- anchor_after ----------------
-                right_part = para[m.end() :].strip()
+                right_part = para[m.end():].strip()
                 if right_part:
                     anchor_after = right_part
                 else:
                     anchor_after = ""
-                    max_template_distance = 6  # увеличиваем дальность поиска anchor_after
+                    max_template_distance = 6
                     forbidden_after = [
-                        "(подпись)",
-                        "(инициалы",
-                        "фамилия",
-                        "подпись",
-                        "инициалы",
-                        "(инициалы, фамилия)",
-                        "подпись обучающегося",
-                        "(подпись обучающегося)",
+                        "(подпись)", "(инициалы", "фамилия", "подпись", "инициалы",
+                        "(инициалы, фамилия)", "подпись обучающегося", "(подпись обучающегося)",
                     ]
                     for j in range(idx + 1, min(len(paragraphs), idx + 1 + max_template_distance)):
                         next_para = paragraphs[j].strip()
-                        if not next_para:
-                            continue
+                        if not next_para: continue
                         next_lower = next_para.lower()
-                        # пропускаем служебные строки — подписи и т.д.
-                        if any(f in next_lower for f in forbidden_after):
-                            continue
+                        if any(f in next_lower for f in forbidden_after): continue
                         if (
-                            not inline_pattern.search(next_para)
-                            and not any(sp in next_lower for sp in skip_patterns)
+                                not inline_pattern.search(next_para)
+                                and not any(sp in next_lower for sp in skip_patterns)
                         ):
                             anchor_after = next_para
                             break
@@ -221,6 +212,8 @@ class Template:
                         "name": raw_name,
                         "type": Template._normalize_type(raw_type),
                         "optional": optional_flag,
+                        "group_name": raw_group_name,
+                        "group_condition": raw_group_condition,
                         "anchor_before": anchor_before,
                         "anchor_after": anchor_after,
                         "source_paragraph": para,
@@ -234,12 +227,9 @@ class Template:
         for p in placeholders:
             key = (
                 p["name"].lower(),
-                re.sub(r"\s+", " ", p["anchor_before"].strip()).lower()
-                if p["anchor_before"]
-                else "",
-                re.sub(r"\s+", " ", p["anchor_after"].strip()).lower()
-                if p["anchor_after"]
-                else "",
+                re.sub(r"\s+", " ", p["anchor_before"].strip()).lower() if p["anchor_before"] else "",
+                re.sub(r"\s+", " ", p["anchor_after"].strip()).lower() if p["anchor_after"] else "",
+                p["group_name"].lower(), p["group_condition"].lower(),
             )
             if key not in seen:
                 seen.add(key)
@@ -247,10 +237,7 @@ class Template:
 
         # маркер "следующий placeholder подряд"
         for i in range(len(unique) - 1):
-            if unique[i + 1]["para_index"] - unique[i]["para_index"] <= 1:
-                unique[i]["next_is_placeholder"] = True
-            else:
-                unique[i]["next_is_placeholder"] = False
+            unique[i]["next_is_placeholder"] = unique[i + 1]["para_index"] - unique[i]["para_index"] <= 1
 
         return unique
 
@@ -271,72 +258,80 @@ class Template:
 
 
 # ============================================================
-#  DocumentChecker
+#  DocumentChecker (МОДИФИЦИРОВАН)
 # ============================================================
 class DocumentChecker:
-    """Проверяет документ по anchors."""
+    """Проверяет документ по anchors и выполняет групповые проверки."""
 
     def __init__(self, template: Template):
         self.template = template
+        # Компилируем шаблон для поиска Placeholder как стоп-сигнала
+        self._placeholder_pattern = re.compile(r"\[\[.*?\]\]")
+
+        # НОВЫЙ МЕТОД: Извлечение первого числа
+
+    @staticmethod
+    def _extract_first_number(value: str) -> str | None:
+        """Извлекает первое число (целое или десятичное) из строки."""
+        if not value:
+            return None
+        # Ищем число в формате [+-]?\s*\d+([.,]\d+)?
+        m = re.search(r"([+-]?\s*\d+([.,]\d+)?)", value)
+        if m:
+            # Возвращаем найденную группу, очищенную от пробелов
+            return m.group(1).strip()
+        return None
 
     @staticmethod
     def _validate_type(value: str, expected_type: str) -> bool:
-        if not value:
-            return False
+        if not value: return False
         v = value.strip()
-        if expected_type == "string":
-            return bool(re.search(r"[A-Za-zА-Яа-яЁё]", v))
-        if expected_type == "number":
-            return bool(re.fullmatch(r"[+-]?\d+([.,]\d+)?", v))
-        if expected_type == "date":
-            return bool(
-                re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", v)
-                or re.search(r"\d{1,2}\s+[А-Яа-яёЁ]+\.?\s+\d{4}", v)
-            )
+        if expected_type == "string": return bool(re.search(r"[A-Za-zА-Яа-яЁё]", v))
+        # Проверка для числовых полей теперь строгая (только число в абзаце)
+        if expected_type == "number": return bool(
+            re.fullmatch(r"[+-]?\s*\d+([.,]\d+)?", v.replace(' ', '')))
+        if expected_type == "date": return bool(
+            re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", v) or re.search(r"\d{1,2}\s+[А-Яа-яёЁ]+\.?\s+\d{4}", v))
         return True
 
     @staticmethod
     def _is_anchor_like(value: str, anchors: list) -> bool:
-        if not value:
-            return False
+        if not value: return False
         v = re.sub(r"\s+", " ", value).strip().lower()
         for a in anchors:
-            if not a:
-                continue
+            if not a: continue
             a_norm = re.sub(r"\s+", " ", a).strip().lower()
-            if v == a_norm:
-                return True
+            if v == a_norm: return True
         return False
 
     def _find_value_using_anchors(
-        self, anchor_before, anchor_after, doc_paragraphs, start_index=0, expected_type=None, next_is_placeholder=False
+            self, anchor_before, anchor_after, doc_paragraphs, start_index=0, expected_type=None,
+            next_is_placeholder=False
     ):
-        """Поиск значения между anchors с ограничением дистанции и без глобального fallback."""
-
-        stop_words = [
-            "введение",
-            "заключение",
-            "список использованных источников",
-            "примерный календарный график",
-            "приложение",
-            "руководитель курсового проекта",
-            "куратор",
-            "проверяющий",
-            "обучающемуся",
-            "задание",
+        stop_words_list = [
+            "введение", "заключение", "список использованных источников",
+            "примерный календарный график", "приложение", "руководитель курсового проекта",
+            "куратор", "проверяющий", "обучающемуся", "задание",
         ]
 
         def find_positions(anchor):
-            if not anchor:
-                return []
-            a_norm = re.sub(r"\s+", " ", anchor.strip()).lower()
+            if not anchor: return []
+            # Упрощаем якорь для поиска (удаляем кавычки, сжимаем пробелы)
+            a_norm = re.sub(r'["\s]+', ' ', anchor.strip()).lower()
             pos = []
             for i in range(start_index, len(doc_paragraphs)):
                 para = doc_paragraphs[i]
-                if para is None:
-                    continue
-                para_norm = re.sub(r"\s+", " ", para.strip()).lower()
-                if para_norm and re.search(r"(?<!\w)" + re.escape(a_norm) + r"(?!\w)", para_norm, flags=re.IGNORECASE):
+                if para is None: continue
+
+                # Добавляем разделители для поиска в таблицах:
+                # Ищем якорь как отдельное слово/ячейку в извлеченном тексте
+                para_norm_cells = re.sub(r"[,;]+", "|", para.strip()).lower()
+                para_norm_text = re.sub(r"\s+", " ", para.strip()).lower()
+
+                # Проверка:
+                # 1. Точное вхождение в нормализованный текст
+                # 2. Вхождение как отдельная "ячейка" (с учетом разделителей ",")
+                if a_norm in para_norm_text or a_norm in para_norm_cells.split('|'):
                     pos.append(i)
             return pos
 
@@ -344,101 +339,134 @@ class DocumentChecker:
         pos_after = find_positions(anchor_after)
 
         def candidate_ok(val, anchors):
-            if not val:
-                return False
+            if not val: return False
             v = val.strip()
-            if v == "":
-                return False
-            if self._is_anchor_like(v, anchors):
-                return False
-            # не считаем нумерацию раздела ("1.", "2.", "3.")
-            if re.match(r"^\d+\.", v):
-                return False
-            # игнорируем служебные заголовки (Заключение, Введение и пр.)
-            if any(sw in v.lower() for sw in stop_words):
-                return False
-            # также игнорируем подписи/инициалы как значения
-            if re.search(r"подпись|иниц|инициалы|фамил", v.lower()):
-                return False
-            if expected_type:
-                return self._validate_type(v, expected_type)
+            if v == "": return False
+            # Проверка, не является ли значение самим якорем
+            if self._is_anchor_like(v, anchors): return False
+            # Проверка на список или заголовок
+            if re.match(r"^\d+\.", v): return False
+            # Проверка на общие стоп-слова
+            if any(sw in v.lower() for sw in stop_words_list): return False
+            if re.search(r"подпись|иниц|инициалы|фамил", v.lower()): return False
+            # Проверка типа (только если не числовое поле)
+            if expected_type and expected_type != 'number': return self._validate_type(v, expected_type)
+            # Для числовых полей возвращаем True, т.к. извлечение числа происходит отдельно
             return True
 
-        # Сценарий: есть оба anchors -> ищем между ними (как раньше), но с ограничением дистанции
+        # --- НОВАЯ ЛОГИКА ДЛЯ ЧИСЛОВЫХ ПОЛЕЙ (ПРИОРИТЕТ SEQUENTIAL) ---
+        if expected_type == 'number':
+            max_forward_search = 10
+            start_pos = start_index
+
+            # Эвристика: если якорь перед полем найден, начинаем с него + 1
+            if pos_before:
+                start_pos = pos_before[0] + 1
+
+            for k in range(start_pos, min(len(doc_paragraphs), start_pos + max_forward_search)):
+                cand_raw = doc_paragraphs[k]
+
+                if cand_raw is None or cand_raw.strip() == "":
+                    continue
+
+                cand = cand_raw.strip()
+                cand_lower = cand.lower()
+
+                # Жесткий стоп на терминаторах
+                if any(sw in cand_lower for sw in stop_words_list) or re.search(
+                        r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand_lower):
+                    break
+
+                # Стоп-сигнал: следующий Placeholder (граница следующего поля)
+                if self._placeholder_pattern.search(cand):
+                    break
+
+                extracted_number = self._extract_first_number(cand)
+
+                if extracted_number:
+                    # Нашли число! Используем его как значение.
+                    # Дополнительная проверка на совпадение с якорем (хотя число вряд ли будет якорем)
+                    if not self._is_anchor_like(extracted_number, [anchor_before, anchor_after]):
+                        return True, extracted_number, k
+
+                # Если не нашли число и абзац содержит много текста, предполагаем выход из таблицы
+                if not extracted_number and len(cand) > 30:
+                    break
+
+                # Продолжаем поиск, если не нашли число, и это короткий не-терминальный текст (разделитель)
+                continue
+
+            # Если мы дошли до конца цикла, то число не найдено
+            return False, None, -1
+
+        # --- СТАРАЯ ЛОГИКА ДЛЯ НЕЧИСЛОВЫХ ПОЛЕЙ (Остается anchor-based) ---
+
+        # 1. Поиск по двум якорям
         if pos_before and pos_after:
             best = None
             best_dist = None
             for b in pos_before:
                 for a in pos_after:
-                    if b > a:
-                        continue
+                    if b >= a: continue  # Якорь after должен быть после якоря before
                     dist = a - b
                     if best_dist is None or dist < best_dist:
                         best_dist = dist
                         best = (b, a)
             if best:
                 b, a = best
-                # ограничение дистанции
                 max_doc_distance = 8
                 if a - b > max_doc_distance:
-                    pos_after = []  # anchor_after слишком далеко
+                    pos_after = []  # Слишком далеко, сбросить
                 else:
-                    consecutive = (a - b) <= 1
-                    if consecutive or next_is_placeholder:
-                        return False, None, -1
+                    if (a - b == 1) or next_is_placeholder:
+                        pass
+                    else:
+                        for k in range(b + 1, a):
+                            mid = doc_paragraphs[k].strip()
+                            if candidate_ok(mid, [anchor_before, anchor_after]):
+                                return True, mid, k
 
-                    # проверяем текст между anchors
-                    for k in range(b + 1, a):
-                        mid = doc_paragraphs[k].strip()
-                        if candidate_ok(mid, [anchor_before, anchor_after]):
-                            return True, mid, k
-
-        # только anchor_before
+        # 2. Поиск по одному якорю (anchor_before)
         if pos_before:
             for b in pos_before:
+                # 2.1 Поиск на той же строке
                 para_b = doc_paragraphs[b] or ""
                 low_b = para_b.lower()
                 ab = anchor_before.strip().lower()
                 idx_b = low_b.find(ab)
                 if idx_b != -1:
-                    after_b = para_b[idx_b + len(ab) :].strip()
+                    after_b = para_b[idx_b + len(ab):].strip()
                     if candidate_ok(after_b, [anchor_before, anchor_after]):
                         return True, after_b, b
-                # ограничиваем поиск максимум до первой пустой строки или до служебного слова
-                for k in range(b + 1, len(doc_paragraphs)):
+
+                # 2.2 Поиск в последующих строках
+                max_forward_search = 10
+                for k in range(b + 1, min(len(doc_paragraphs), b + 1 + max_forward_search)):
                     cand_raw = doc_paragraphs[k]
-                    # если anchor_after отсутствует — пропускаем пустые строки
-                    if not anchor_after:
-                        if cand_raw is None:
-                            continue
-                        cand = cand_raw.strip()
-                        if cand == "":
-                            continue  # просто пропускаем пустые строки
-                    else:
-                        if cand_raw is None or cand_raw.strip() == "":
-                            break
+
+                    if cand_raw is None or cand_raw.strip() == "":
+                        continue
 
                     cand = cand_raw.strip()
-                    # если встретили служебный раздел — прекращаем поиск
-                    if any(sw in cand.lower() for sw in stop_words):
+                    cand_lower = cand.lower()
+
+                    # ------------------------------------------------------------
+                    # Логика для нечисловых полей:
+                    # ------------------------------------------------------------
+
+                    # 1. Жесткий стоп на терминаторах документа/подписях
+                    if any(sw in cand_lower for sw in ["введение", "заключение", "список", "приложение"]) or re.search(
+                            r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand_lower):
                         break
-                    # если это явно подпись/инициалы — прекращаем (не берём как значение)
-                    if re.search(r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand.lower()):
-                        break
+
+                    # 2. Если найдено подходящее значение, возвращаем его.
                     if candidate_ok(cand, [anchor_before, anchor_after]):
                         return True, cand, k
 
-                    cand = cand_raw.strip()
-                    # если встретили служебный раздел — прекращаем поиск
-                    if any(sw in cand.lower() for sw in stop_words):
-                        break
-                    # если это явно подпись/инициалы — прекращаем (не берём как значение)
-                    if re.search(r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand.lower()):
-                        break
-                    if candidate_ok(cand, [anchor_before, anchor_after]):
-                        return True, cand, k
+                    # 3. Во всех остальных случаях: прерываем поиск.
+                    break
 
-        # только anchor_after
+        # 3. Поиск по одному якорю (anchor_after)
         if pos_after:
             for a in pos_after:
                 para_a = doc_paragraphs[a] or ""
@@ -449,27 +477,151 @@ class DocumentChecker:
                     before_a = para_a[:idx_a].strip()
                     if candidate_ok(before_a, [anchor_before, anchor_after]):
                         return True, before_a, a
-                # смотрим только одну строчку перед anchor_after (основной сценарий даты/имени)
+
                 k = a - 1
                 if k >= 0:
                     cand_raw = doc_paragraphs[k]
                     if cand_raw and cand_raw.strip():
                         cand = cand_raw.strip()
-                        # служебные слова / подпись не считаем значением
-                        if any(sw in cand.lower() for sw in stop_words):
-                            break
-                        if re.search(r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand.lower()):
-                            break
+                        if any(sw in cand.lower() for sw in stop_words_list) or re.search(
+                                r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand.lower()):
+                            continue
                         if candidate_ok(cand, [anchor_before, anchor_after]):
                             return True, cand, k
 
-        # ❌ удалён прежний глобальный fallback
         return False, None, -1
 
     # ------------------------------------------------------------
+    # ✨ Оценка произвольного условия
+    def _evaluate_group_condition(self, condition: str, sum_val: float, num_values: int) -> tuple:
+        """Выполняет проверку группового условия (SUM, AVG) с операторами."""
+        if not condition:
+            return True, "Нет условия для проверки."
+
+        condition = condition.strip().upper().replace(' ', '')
+
+        # Шаблон: (SUM|AVG)([<=>!]+)(\d+(\.\d+)?)
+        m = re.match(r"(SUM|AVG)([<=>!]+)(\d+(\.\d+)?)", condition)
+
+        if not m:
+            return False, f"Условие '{condition}' не распознано или не поддерживается."
+
+        check_type = m.group(1)
+        operator = m.group(2)
+        target = float(m.group(3))
+
+        value_to_check = sum_val
+        check_name = "Сумма"
+
+        if check_type == "AVG":
+            if num_values == 0:
+                return False, "Невозможно вычислить среднее: в группе нет валидных чисел."
+            value_to_check = sum_val / num_values
+            check_name = "Среднее"
+
+        # Выполнение сравнения с учетом допуска (tolerance)
+        tolerance = 0.001
+        is_valid = False
+
+        if operator == '=':
+            is_valid = abs(value_to_check - target) < tolerance
+        elif operator == '>=':
+            is_valid = value_to_check >= target
+        elif operator == '<=':
+            is_valid = value_to_check <= target
+        elif operator == '>':
+            is_valid = value_to_check > target
+        elif operator == '<':
+            is_valid = value_to_check < target
+        elif operator == '!=':
+            is_valid = abs(value_to_check - target) >= tolerance
+
+        result_val_str = f"{value_to_check:.2f}"
+
+        if is_valid:
+            message = f"{check_name} ({result_val_str}) соответствует условию {check_type}{operator}{target}."
+        else:
+            message = f"{check_name} ({result_val_str}) не соответствует условию {check_type}{operator}{target}."
+
+        return is_valid, message
+
+    # ------------------------------------------------------------
+    # ✨ МЕТОД ДЛЯ ГРУПП
+    def _check_groups(self, results: list) -> list:
+        """Проверяет групповые условия, используя произвольные условия из шаблона."""
+
+        groups_to_check = {}
+
+        for r in results:
+            group_name = r.get("group_name")
+            group_condition = r.get("group_condition", "").strip()
+
+            if group_name and group_condition:
+                # Ключ включает условие, чтобы группы с разными условиями обрабатывались отдельно
+                key = (group_name, group_condition)
+
+                if key not in groups_to_check:
+                    groups_to_check[key] = {
+                        "condition": group_condition,
+                        "valid_values": [],
+                        "total_sum": 0.0,
+                        "all_ok": True,
+                        "missing_fields": []
+                    }
+
+                # Проверяем, что поле найдено и имеет числовой тип
+                if r['status'] == 'ok' and r['expected_type'] == 'number':
+                    try:
+                        val_str = str(r['value']).replace(' ', '').replace(',', '.')
+                        float_value = float(val_str)
+                        groups_to_check[key]["valid_values"].append(float_value)
+                        groups_to_check[key]["total_sum"] += float_value
+                    except ValueError:
+                        groups_to_check[key]["all_ok"] = False
+                        groups_to_check[key]["missing_fields"].append(f"{r['field']} (не число)")
+                else:
+                    # Если поле не найдено, невалидно или не числовое — группа не может быть проверена
+                    groups_to_check[key]["all_ok"] = False
+                    groups_to_check[key]["missing_fields"].append(r['field'])
+
+        # 2. Проверяем каждую группу
+        group_report = []
+
+        for (group_name, condition), data in groups_to_check.items():
+            sum_val = data["total_sum"]
+            num_values = len(data["valid_values"])
+
+            if data["all_ok"]:
+                # Если все поля найдены и валидны, оцениваем заданное условие
+                is_valid, message = self._evaluate_group_condition(
+                    condition, sum_val, num_values
+                )
+
+                status = "group_ok" if is_valid else "group_condition_invalid"
+            else:
+                status = "group_check_failed"
+                missing_list = ", ".join(data['missing_fields'])
+                message = f"Группа '{group_name}' не проверена: не все поля найдены/валидны. Проблема с полями: {missing_list}."
+
+            group_report.append({
+                "field": f"Группа: {group_name}",
+                "status": status,
+                "value": f"{sum_val:.2f}",
+                "group_name": group_name,
+                "group_condition": condition,
+                "message": message
+            })
+
+        return group_report
+
     def check_document(self, doc_paragraphs: list) -> list:
         results = []
         cursor = 0
+        max_len = len(doc_paragraphs)
+
+        # Пропускаем начальные пустые абзацы
+        while cursor < max_len and not doc_paragraphs[cursor].strip():
+            cursor += 1
 
         for ph in self.template.get_placeholders():
             name = ph["name"]
@@ -478,6 +630,8 @@ class DocumentChecker:
             anchor_before = ph.get("anchor_before", "").strip()
             anchor_after = ph.get("anchor_after", "").strip()
             next_is_placeholder = ph.get("next_is_placeholder", False)
+            group_name = ph.get("group_name", "")
+            group_condition = ph.get("group_condition", "")
 
             found, value, found_idx = self._find_value_using_anchors(
                 anchor_before, anchor_after, doc_paragraphs, cursor, expected_type, next_is_placeholder
@@ -492,11 +646,19 @@ class DocumentChecker:
                         "optional": optional,
                         "anchor_before": anchor_before,
                         "anchor_after": anchor_after,
+                        "group_name": group_name,
+                        "group_condition": group_condition,
                     }
                 )
+                # Эвристика для табличных данных: если поле пропущено, сдвигаем курсор на 1,
+                # чтобы следующее поле в таблице не начало поиск с того же места.
+                if expected_type == 'number' and name.startswith("Этап_"):
+                    cursor = max(cursor, cursor + 1)
                 continue
 
-            is_valid = self._validate_type(value, expected_type)
+            # Если найдено, то для числовых полей value - это уже извлеченное число
+            is_valid = self._validate_type(value, expected_type) if expected_type != 'number' else True
+
             results.append(
                 {
                     "field": name,
@@ -507,13 +669,23 @@ class DocumentChecker:
                     "anchor_before": anchor_before,
                     "anchor_after": anchor_after,
                     "found_paragraph_index": found_idx,
+                    "group_name": group_name,
+                    "group_condition": group_condition,
                 }
             )
-            cursor = max(cursor, found_idx + 1)
 
-        return results
+            # Обновляем курсор, чтобы поля шли по порядку.
+            cursor = max(cursor, found_idx + 1)
+            while cursor < max_len and not doc_paragraphs[cursor].strip():
+                cursor += 1
+
+        # Выполнение групповой проверки
+        group_results = self._check_groups(results)
+
+        return results + group_results
 
     # ------------------------------------------------------------
+    # ✨ Генерирование отчета
     def generate_report(self, file_name: str, results: list) -> str:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         header = (
@@ -525,17 +697,38 @@ class DocumentChecker:
 
         lines = [header, "=== Проверка заполнителей ===\n"]
 
+        group_reports = []
+
         for r in results:
+            if r["field"].startswith("Группа:"):
+                group_reports.append(r)
+                continue
+
+            group_info = ""
+            if r.get('group_name'):
+                group_info = f" [Группа: **{r['group_name']}** / Условие: `{r.get('group_condition', '—')}`]"
+
             if r["status"] == "ok":
-                lines.append(f"✅ {r['field']} — найдено: {r['value']}")
+                lines.append(f"✅ {r['field']} — найдено: **{r['value']}**{group_info}")
             elif r["status"] == "invalid":
                 lines.append(
-                    f"⚠️ {r['field']} — найдено, но тип не соответствует ({r['expected_type']}): {r['value']}"
+                    f"⚠️ {r['field']} — найдено, но тип не соответствует ({r['expected_type']}): **{r['value']}**{group_info}"
                 )
             elif r["status"] == "missing_optional":
-                lines.append(f"ℹ️ {r['field']} — отсутствует (необязательное)")
+                lines.append(f"ℹ️ {r['field']} — отсутствует (необязательное){group_info}")
             elif r["status"] == "missing":
-                lines.append(f"❌ {r['field']} — отсутствует или не найдено корректное значение")
+                lines.append(f"❌ {r['field']} — отсутствует или не найдено корректное значение{group_info}")
+
+        # Добавляем отчеты по группам в конец
+        if group_reports:
+            lines.append("\n=== Проверка групповых условий ===\n")
+            for gr in group_reports:
+                if gr['status'] == 'group_ok':
+                    lines.append(f"✅ **{gr['field']}** — Успех. {gr['message']}")
+                elif gr['status'] == 'group_condition_invalid':
+                    lines.append(f"❌ **{gr['field']}** — Ошибка. {gr['message']}")
+                elif gr['status'] == 'group_check_failed':
+                    lines.append(f"⚠️ **{gr['field']}** — Невозможно проверить. {gr['message']}")
 
         return "\n".join(lines)
 
@@ -571,13 +764,15 @@ class AppGUI:
         self.load_template_btn = tk.Button(btn_frame, text="Загрузить шаблон", width=18, command=self.load_template)
         self.load_template_btn.pack(side="left", padx=(0, 8))
 
-        self.load_doc_btn = tk.Button(btn_frame, text="Загрузить документ", width=22, state="disabled", command=self.load_document)
+        self.load_doc_btn = tk.Button(btn_frame, text="Загрузить документ", width=22, state="disabled",
+                                      command=self.load_document)
         self.load_doc_btn.pack(side="left", padx=(0, 8))
 
         self.run_check_btn = tk.Button(btn_frame, text="Проверить", width=12, state="disabled", command=self.run_check)
         self.run_check_btn.pack(side="left")
 
-        self.save_report_btn = tk.Button(btn_frame, text="Сохранить отчёт", width=16, state="disabled", command=self.save_report)
+        self.save_report_btn = tk.Button(btn_frame, text="Сохранить отчёт", width=16, state="disabled",
+                                         command=self.save_report)
         self.save_report_btn.pack(side="right")
 
         self.template_label = tk.Label(frame, text="Шаблон: (не загружен)", anchor="w")
@@ -587,7 +782,8 @@ class AppGUI:
 
         self.result_text = scrolledtext.ScrolledText(frame, wrap=tk.WORD, width=110, height=30, font=("Segoe UI", 10))
         self.result_text.pack(fill="both", expand=True)
-        self.result_text.insert(tk.END, "Программа для автоматической проверки самостоятельных работ.\nПожалуйста, загрузите шаблон и документ.")
+        self.result_text.insert(tk.END,
+                                "Программа для автоматической проверки самостоятельных работ.\nПожалуйста, загрузите шаблон и документ.")
 
     def load_template(self):
         path = filedialog.askopenfilename(filetypes=[("Word", "*.docx"), ("PDF", "*.pdf")])
@@ -598,7 +794,10 @@ class AppGUI:
             self.template = tpl
             info = []
             for i, p in enumerate(tpl.get_placeholders(), 1):
+                group_name = p['group_name'] if p['group_name'] else '—'
+                group_cond = p['group_condition'] if p['group_condition'] else '—'
                 info.append(f"{i}. {p['name']} ({p['type']})")
+                info.append(f"   optional: {p['optional']}, group: {group_name}, condition: {group_cond}")
                 info.append(f"   anchor_before: '{p['anchor_before']}'")
                 info.append(f"   anchor_after : '{p['anchor_after']}'")
                 info.append(f"   para_index: {p['para_index']}\n")
@@ -625,13 +824,16 @@ class AppGUI:
         if not self.template or not self.document_paragraphs:
             messagebox.showwarning("Ошибка", "Сначала загрузите шаблон и документ.")
             return
-        self.checker = DocumentChecker(self.template)
-        results = self.checker.check_document(self.document_paragraphs)
-        report = self.checker.generate_report(os.path.basename(self.document_path), results)
-        self.result_text.delete(1.0, tk.END)
-        self.result_text.insert(tk.END, report)
-        self._last_report_text = report
-        self.save_report_btn.config(state="normal")
+        try:
+            self.checker = DocumentChecker(self.template)
+            results = self.checker.check_document(self.document_paragraphs)
+            report = self.checker.generate_report(os.path.basename(self.document_path), results)
+            self.result_text.delete(1.0, tk.END)
+            self.result_text.insert(tk.END, report)
+            self._last_report_text = report
+            self.save_report_btn.config(state="normal")
+        except Exception as e:
+            messagebox.showerror("Ошибка проверки", f"Произошла ошибка при выполнении проверки: {e}")
 
     def save_report(self):
         if not self._last_report_text:
