@@ -3,6 +3,7 @@ import os
 import logging
 import re
 from datetime import datetime
+from typing import List, Dict, Tuple, Any
 
 # Библиотеки для Telegram
 from aiogram import Bot, Dispatcher, types, F
@@ -16,418 +17,485 @@ import docx
 import PyPDF2
 
 # ============================================================
-#  ЧАСТЬ 1: CORE LOGIC (Ваш исходный код без GUI)
+#  AGENT 1: PERCEPTION AGENT (УЛУЧШЕННЫЙ PDF ПАРСИНГ)
 # ============================================================
-
-class DocumentLoader:
+class PerceptionAgent:
     @staticmethod
     def _normalize_text(s: str) -> str:
         if s is None: return ""
-        s = s.replace("\u00A0", " ").replace("\u200B", "").replace("\uFEFF", "")
-        s = re.sub(r"[ \t\v\f\u00A0]+", " ", s)
+        # 1. Замена спецсимволов и подчеркиваний
+        s = s.replace("_", " ").replace("\u00A0", " ").replace("\u200B", "").replace("\uFEFF", "")
+        # 2. Замена переносов и табуляций
+        s = s.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+        # 3. FIX: Удаление "разрывов" слов в PDF (сентяб ря -> сентября)
+        # Если видим "буква-пробел-буква", и это не предлог (эвристика)
+        # (Это базовая защита, идеальная требует словаря)
+        # Здесь мы просто схлопываем множественные пробелы
+        s = re.sub(r"[ \t\v\f]+", " ", s)
         return s.strip()
 
     @staticmethod
-    def load_docx_text_and_paragraphs(path: str, dedupe: bool = True, preserve_empty: bool = False):
+    def load_content(path: str) -> List[str]:
+        lower = path.lower()
+        if lower.endswith(".docx"):
+            return PerceptionAgent._load_docx(path)
+        elif lower.endswith(".pdf"):
+            return PerceptionAgent._load_pdf(path)
+        else:
+            raise ValueError("Формат не поддерживается")
+
+    @staticmethod
+    def _load_docx(path: str) -> List[str]:
         doc = docx.Document(path)
         paragraphs = []
-        seen = set()
-        def add_para(text):
-            if text is None: text = ""
-            t_norm = DocumentLoader._normalize_text(text) if text else ""
-            if t_norm == "" and not preserve_empty: return
-            if dedupe:
-                if t_norm and t_norm not in seen:
-                    paragraphs.append(t_norm); seen.add(t_norm)
-                elif t_norm == "" and preserve_empty: paragraphs.append(t_norm)
-            else:
-                if t_norm == "" and not preserve_empty: return
-                paragraphs.append(t_norm)
-
-        for p in doc.paragraphs: add_para("".join(run.text for run in p.runs))
+        for p in doc.paragraphs:
+            paragraphs.append(PerceptionAgent._normalize_text(p.text))
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
-                    for p in cell.paragraphs: add_para("".join(run.text for run in p.runs))
-        return "\n".join(paragraphs), paragraphs
+                    paragraphs.append(PerceptionAgent._normalize_text(cell.text))
+        return paragraphs
 
     @staticmethod
-    def load_pdf_text_and_paragraphs(path: str, dedupe: bool = True, preserve_empty: bool = False):
-        text_lines = []
-        seen = set()
+    def _load_pdf(path: str) -> List[str]:
+        lines = []
         with open(path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
-                page_text = page.extract_text() or ""
-                for ln in page_text.splitlines():
-                    ln_norm = DocumentLoader._normalize_text(ln)
-                    if ln_norm == "" and not preserve_empty: continue
-                    if dedupe:
-                        if ln_norm and ln_norm not in seen:
-                            text_lines.append(ln_norm); seen.add(ln_norm)
-                        elif ln_norm == "" and preserve_empty: text_lines.append(ln_norm)
-                    else:
-                        if ln_norm == "" and not preserve_empty: continue
-                        text_lines.append(ln_norm)
-        return "\n".join(text_lines), text_lines
+                text = page.extract_text()
+                if not text: continue
+                
+                # FIX: PyPDF2 часто разбивает таблицы на короткие строки.
+                # Мы не нормализуем сразу, а отдаем сырые строки,
+                # но SchemaAgent теперь умеет их склеивать.
+                for ln in text.splitlines():
+                    norm_ln = PerceptionAgent._normalize_text(ln)
+                    if norm_ln:
+                        lines.append(norm_ln)
+        return lines
 
-    @staticmethod
-    def get_paragraphs(path: str):
-        lower = path.lower()
-        if lower.endswith(".docx"):
-            _, paras = DocumentLoader.load_docx_text_and_paragraphs(path, dedupe=False, preserve_empty=True)
-            return paras
-        elif lower.endswith(".pdf"):
-            _, paras = DocumentLoader.load_pdf_text_and_paragraphs(path, dedupe=False, preserve_empty=True)
-            return paras
-        else:
-            raise ValueError("Поддерживаются только .docx и .pdf")
+# ============================================================
+#  AGENT 2: SCHEMA AGENT (FIX: СКЛЕЙКА РАЗОРВАННЫХ ТЕГОВ)
+# ============================================================
+class SchemaAgent:
+    def parse_template(self, paragraphs: List[str]) -> List[Dict]:
+        placeholders = []
+        # Regex теперь допускает пробелы внутри тега на случай разрывов
+        pattern = re.compile(
+            r"\[\[\s*([^:\]\n]+?)\s*:\s*([^,:]\s*[^,\]\n]+?)"
+            r"(?:\s*:\s*([^:\]\n]+?)\s*:\s*([^,\]\n]+?))?"
+            r"(?:\s*,\s*(optional))?\s*\]\]",
+            flags=re.IGNORECASE,
+        )
 
-class Template:
-    def __init__(self, placeholders=None, source_path=None):
-        self.placeholders = placeholders or []
-        self.source_path = source_path
-    
-    def get_placeholders(self): return self.placeholders
+        seen_names = set()
+        
+        # БУФЕР ДЛЯ СКЛЕЙКИ СТРОК
+        # Если строка содержит '[[', но не содержит ']]', мы не обрабатываем её,
+        # а ждем следующую, чтобы склеить. Это чинит таблицы в PDF.
+        buffer = ""
+        buffer_start_idx = 0
 
-    @staticmethod
-    def _normalize_type(raw_type: str) -> str:
-        t = raw_type.strip().lower()
-        if t in ("int", "integer", "num", "number", "float"): return "number"
+        processed_paragraphs = [] # Список (текст, оригинальный индекс)
+
+        # 1. Предварительная обработка: склейка разорванных тегов
+        for idx, para in enumerate(paragraphs):
+            # Если в буфере что-то есть, добавляем текущую строку к нему
+            if buffer:
+                buffer += " " + para
+                # Если тег закрылся
+                if "]]" in para:
+                    processed_paragraphs.append((buffer, buffer_start_idx))
+                    buffer = ""
+                continue
+            
+            # Если начало тега есть, а конца нет — начинаем накапливать буфер
+            if "[[" in para and "]]" not in para:
+                buffer = para
+                buffer_start_idx = idx
+                continue
+            
+            # Обычная строка
+            processed_paragraphs.append((para, idx))
+
+        # 2. Парсинг
+        for text, original_idx in processed_paragraphs:
+            if not text.strip(): continue
+            
+            for m in pattern.finditer(text):
+                name = m.group(1).strip()
+                if name.lower() in seen_names: continue
+                seen_names.add(name.lower())
+
+                data = {
+                    "name": name,
+                    "type": self._normalize_type(m.group(2).strip()),
+                    "group_name": m.group(3).strip() if m.group(3) else "",
+                    "group_condition": m.group(4).strip() if m.group(4) else "",
+                    "optional": bool(m.group(5)),
+                    "anchor_before": "",
+                }
+
+                # Якорь берем из склеенного текста
+                left_part = text[: m.start()].strip()
+                if left_part:
+                    # Берем последние 30 символов, чтобы якорь не был слишком длинным
+                    data["anchor_before"] = left_part[-40:]
+                else:
+                    # Ищем в предыдущих "чистых" параграфах
+                    # (Упрощенная логика для склеенных строк)
+                    stop_patterns = ["утверждаю", "задание", "введение"]
+                    for j in range(len(processed_paragraphs) - 1, -1, -1):
+                        prev_txt, prev_idx = processed_paragraphs[j]
+                        if prev_idx >= original_idx: continue # Не смотрим вперед
+                        
+                        if prev_txt and "[[" not in prev_txt and not any(s in prev_txt.lower() for s in stop_patterns):
+                            data["anchor_before"] = prev_txt
+                            break
+
+                placeholders.append(data)
+
+        return placeholders
+
+    def _normalize_type(self, t):
+        t = t.lower()
+        if t in ("int", "integer", "num", "number"): return "number"
         if t in ("str", "string", "text"): return "string"
-        if t in ("date", "dt"): return "date"
         return t
 
-    @staticmethod
-    def extract_placeholders_from_paragraphs(paragraphs: list) -> list:
-        placeholders = []
-        inline_pattern = re.compile(r"\[\[\s*([^:\]\n]+?)\s*:\s*([^,\]\n]+?)(?:\s*,\s*(optional))?\s*\]\]", flags=re.IGNORECASE)
-        skip_patterns = ["утверждаю", "задание", "введение", "заключение", "список использованных источников", "примерный календарный график", "подпись обучающегося"]
+# ============================================================
+#  AGENT 3: EXTRACTION AGENT (КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ)
+# ============================================================
+class ExtractionAgent:
+    def __init__(self):
+        self.stop_words = [
+            "введение", "заключение", "список использованных источников",
+            "приложение", "задание", "руководитель", "куратор", "проверяющий",
+            "наименование этапов" # Добавлено, чтобы не хватало заголовки таблиц
+        ]
 
-        for idx, para in enumerate(paragraphs):
-            if not para.strip(): continue
-            for m in inline_pattern.finditer(para):
-                raw_name = m.group(1).strip()
-                raw_type = m.group(2).strip()
-                optional_flag = bool(m.group(3))
-                left_part = para[: m.start()].strip()
-                
-                # anchor_before
-                if left_part: anchor_before = left_part
-                else:
-                    anchor_before = ""
-                    for j in range(idx - 1, -1, -1):
-                        prev_para = paragraphs[j].strip()
-                        if prev_para and not inline_pattern.search(prev_para) and not any(sp in prev_para.lower() for sp in skip_patterns):
-                            anchor_before = prev_para; break
-                
-                # anchor_after
-                right_part = para[m.end() :].strip()
-                if right_part: anchor_after = right_part
-                else:
-                    anchor_after = ""
-                    max_dist = 6
-                    forbidden = ["(подпись)", "подпись", "инициалы", "фамилия"]
-                    for j in range(idx + 1, min(len(paragraphs), idx + 1 + max_dist)):
-                        next_para = paragraphs[j].strip()
-                        if not next_para: continue
-                        if any(f in next_para.lower() for f in forbidden): continue
-                        if not inline_pattern.search(next_para) and not any(sp in next_para.lower() for sp in skip_patterns):
-                            anchor_after = next_para; break
-                
-                placeholders.append({
-                    "name": raw_name, "type": Template._normalize_type(raw_type),
-                    "optional": optional_flag, "anchor_before": anchor_before,
-                    "anchor_after": anchor_after, "para_index": idx
-                })
+    def _clean_anchor(self, text):
+        return re.sub(r'[^a-zA-Zа-яА-Я0-9]', '', text).lower()
 
-        # dedupe
-        seen = set()
-        unique = []
-        for p in placeholders:
-            key = (p["name"].lower(), p["anchor_before"], p["anchor_after"])
-            if key not in seen:
-                seen.add(key); unique.append(p)
+    def find_value(self, item: Dict, doc_paragraphs: List[str], start_cursor: int) -> Tuple[bool, str, int]:
+        anchor = item.get("anchor_before")
+        expected_type = item.get("type")
         
-        # next_is_placeholder logic
-        for i in range(len(unique) - 1):
-            if unique[i + 1]["para_index"] - unique[i]["para_index"] <= 1:
-                unique[i]["next_is_placeholder"] = True
-            else:
-                unique[i]["next_is_placeholder"] = False
-        return unique
+        if not anchor:
+            return False, None, start_cursor
 
-    @classmethod
-    def load_from_file(cls, path: str):
-        lower = path.lower()
-        if lower.endswith(".docx"):
-            _, paragraphs = DocumentLoader.load_docx_text_and_paragraphs(path, dedupe=True, preserve_empty=False)
-        elif lower.endswith(".pdf"):
-            _, paragraphs = DocumentLoader.load_pdf_text_and_paragraphs(path, dedupe=True, preserve_empty=False)
+        clean_anchor = self._clean_anchor(anchor)
+        
+        # Поиск строки, содержащей якорь
+        target_idx = -1
+        for i in range(start_cursor, len(doc_paragraphs)):
+            # Нестрогое сравнение: содержится ли очищенный якорь в очищенной строке
+            if clean_anchor in self._clean_anchor(doc_paragraphs[i]):
+                target_idx = i
+                break
+        
+        if target_idx == -1:
+            return False, None, start_cursor
+
+        # === СТРАТЕГИЯ 0: ИЗВЛЕЧЕНИЕ ИЗ ТОЙ ЖЕ СТРОКИ (Same Line) ===
+        # Это решит проблему "3. Разработка фыв" и "Сальников"
+        current_text = doc_paragraphs[target_idx]
+        
+        # Находим, где кончается якорь в реальном тексте
+        # (Упрощенно: разбиваем строку по тексту якоря, если он там есть целиком)
+        # Для надежности используем regex escape
+        match = re.search(re.escape(PerceptionAgent._normalize_text(anchor)), current_text, re.IGNORECASE)
+        
+        candidate_same_line = ""
+        if match:
+            candidate_same_line = current_text[match.end():].strip()
         else:
-            raise ValueError("Поддерживаются только .docx и .pdf")
-        
-        placeholders = cls.extract_placeholders_from_paragraphs(paragraphs)
-        if not placeholders:
-            raise ValueError("В шаблоне не найдено ни одного заполнителя [[...]]")
-        return cls(placeholders=placeholders, source_path=path)
+            # Если точного совпадения нет (из-за очистки), пробуем эвристику:
+            # Берем последние 70% строки, если она длинная
+            pass 
 
-class DocumentChecker:
-    def __init__(self, template: Template):
-        self.template = template
+        if candidate_same_line:
+            # Если ожидаем число
+            if expected_type == "number":
+                num = self._extract_number(candidate_same_line)
+                if num: return True, num, target_idx
+            # Если ожидаем строку/дату
+            else:
+                # Проверка: не является ли остаток просто мусором или стоп-словом
+                if len(candidate_same_line) > 1 and not any(sw in candidate_same_line.lower() for sw in self.stop_words):
+                    return True, candidate_same_line, target_idx
 
-    @staticmethod
-    def _validate_type(value: str, expected_type: str) -> bool:
+        # === СТРАТЕГИЯ 1: ПОИСК В СЛЕДУЮЩИХ СТРОКАХ ===
+        # Если на текущей строке пусто, смотрим вниз (макс 4 строки)
+        for k in range(target_idx + 1, min(len(doc_paragraphs), target_idx + 5)):
+            cand = doc_paragraphs[k].strip()
+            if not cand: continue
+            
+            # Стоп-факторы
+            cand_lower = cand.lower()
+            if any(sw in cand_lower for sw in self.stop_words): break
+            if re.match(r"^\d+\.", cand): break # Следующий пункт списка (например, 4. Заключение)
+
+            if expected_type == "number":
+                num = self._extract_number(cand)
+                if num: return True, num, k
+            else:
+                return True, cand, k
+
+        return False, None, target_idx
+
+    def _extract_number(self, text):
+        # Ищет число, игнорируя окружающий текст
+        m = re.search(r"([+-]?\s*\d+([.,]\d+)?)", text)
+        if m: return m.group(1).replace(" ", "")
+        return None
+
+# ============================================================
+#  AGENT 4: ANALYST AGENT (Агент-Аналитик)
+#  Роль: Валидация типов, Математический анализ, Логические выводы.
+# ============================================================
+
+class AnalystAgent:
+    def validate_type(self, value: str, expected_type: str) -> bool:
         if not value: return False
         v = value.strip()
-        if expected_type == "string": return bool(re.search(r"[A-Za-zА-Яа-яЁё]", v))
-        if expected_type == "number": return bool(re.fullmatch(r"[+-]?\d+([.,]\d+)?", v))
-        if expected_type == "date": return bool(re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", v) or re.search(r"\d{1,2}\s+[А-Яа-яёЁ]+\.?\s+\d{4}", v))
+        if expected_type == "string": 
+            return bool(re.search(r"[A-Za-zА-Яа-яЁё]", v))
+        if expected_type == "number": 
+            # Строгая проверка числа
+            clean_v = v.replace(' ', '').replace(',', '.')
+            try:
+                float(clean_v)
+                return True
+            except ValueError:
+                return False
+        if expected_type == "date":
+            return bool(re.search(r"\d{1,2}[\.\s][\w\.]+\s?\d{4}", v))
         return True
 
-    @staticmethod
-    def _is_anchor_like(value: str, anchors: list) -> bool:
-        if not value: return False
-        v = re.sub(r"\s+", " ", value).strip().lower()
-        for a in anchors:
-            if not a: continue
-            if v == re.sub(r"\s+", " ", a).strip().lower(): return True
-        return False
-
-    def _find_value_using_anchors(self, anchor_before, anchor_after, doc_paragraphs, start_index=0, expected_type=None, next_is_placeholder=False):
-        stop_words = ["введение", "заключение", "список использованных источников", "приложение", "задание"]
-        
-        def find_positions(anchor):
-            if not anchor: return []
-            a_norm = re.sub(r"\s+", " ", anchor.strip()).lower()
-            pos = []
-            for i in range(start_index, len(doc_paragraphs)):
-                p = doc_paragraphs[i]
-                if p and re.search(r"(?<!\w)" + re.escape(a_norm) + r"(?!\w)", re.sub(r"\s+", " ", p.strip()).lower(), flags=re.IGNORECASE):
-                    pos.append(i)
-            return pos
-
-        pos_before = find_positions(anchor_before)
-        pos_after = find_positions(anchor_after)
-
-        def candidate_ok(val, anchors):
-            if not val or not val.strip(): return False
-            v = val.strip()
-            if self._is_anchor_like(v, anchors): return False
-            if re.match(r"^\d+\.", v): return False # Нумерация списков
-            if any(sw in v.lower() for sw in stop_words): return False
-            if re.search(r"подпись|иниц|инициалы|фамил", v.lower()): return False
-            if expected_type: return self._validate_type(v, expected_type)
-            return True
-
-        # Стратегия 1: Есть оба якоря
-        if pos_before and pos_after:
-            best_pair = None
-            min_dist = 999
-            for b in pos_before:
-                for a in pos_after:
-                    if b > a: continue
-                    dist = a - b
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_pair = (b, a)
+    def analyze_groups(self, extraction_results: List[Dict]) -> List[Dict]:
+        """
+        Интеллектуальный анализ: группировка данных, вычисление сумм/средних
+        и проверка условий (например, SUM=100).
+        """
+        groups = {}
+        # Сбор данных
+        for res in extraction_results:
+            g_name = res.get("group_name")
+            g_cond = res.get("group_condition")
+            if not g_name or not g_cond: continue
             
-            if best_pair:
-                b, a = best_pair
-                if (a - b) <= 8 and not ((a - b) <= 1 or next_is_placeholder):
-                     for k in range(b + 1, a):
-                        mid = doc_paragraphs[k].strip()
-                        if candidate_ok(mid, [anchor_before, anchor_after]):
-                            return True, mid, k
-
-        # Стратегия 2: Только якорь до
-        if pos_before:
-            for b in pos_before:
-                para_b = doc_paragraphs[b] or ""
-                # Проверка в той же строке
-                ab = anchor_before.strip().lower()
-                idx_b = para_b.lower().find(ab)
-                if idx_b != -1:
-                    after_b = para_b[idx_b + len(ab):].strip()
-                    if candidate_ok(after_b, [anchor_before, anchor_after]): return True, after_b, b
-                
-                # Проверка следующих строк
-                for k in range(b + 1, min(len(doc_paragraphs), b + 8)):
-                    cand = doc_paragraphs[k] or ""
-                    if not anchor_after and not cand.strip(): continue # пропускаем пустые если нет closing anchor
-                    if anchor_after and not cand.strip(): break # пустая строка прерывает поиск если closing anchor важен
-                    
-                    if any(sw in cand.lower() for sw in stop_words): break
-                    if re.search(r"^\(?\s*(подпись|иниц)", cand.lower()): break
-                    
-                    if candidate_ok(cand, [anchor_before, anchor_after]): return True, cand, k
-
-        # Стратегия 3: Только якорь после (для дат в конце и т.д.)
-        if pos_after:
-            for a in pos_after:
-                k = a - 1
-                if k >= 0:
-                    cand = doc_paragraphs[k] or ""
-                    if candidate_ok(cand, [anchor_before, anchor_after]): return True, cand, k
-                    
-        return False, None, -1
-
-    def check_document(self, doc_paragraphs: list) -> list:
-        results = []
-        cursor = 0
-        for ph in self.template.get_placeholders():
-            found, value, idx = self._find_value_using_anchors(
-                ph.get("anchor_before"), ph.get("anchor_after"), doc_paragraphs, cursor, ph["type"], ph.get("next_is_placeholder")
-            )
+            key = (g_name, g_cond)
+            if key not in groups:
+                groups[key] = {"values": [], "missing": []}
             
-            res = {
-                "field": ph["name"], "expected_type": ph["type"],
-                "optional": ph["optional"], "value": value
-            }
-            if not found:
-                res["status"] = "missing_optional" if ph["optional"] else "missing"
+            if res["status"] == "ok" and res["expected_type"] == "number":
+                try:
+                    val = float(res["value"].replace(',', '.').replace(' ', ''))
+                    groups[key]["values"].append(val)
+                except:
+                    groups[key]["missing"].append(res["field"])
             else:
-                is_valid = self._validate_type(value, ph["type"])
-                res["status"] = "ok" if is_valid else "invalid"
-                cursor = max(cursor, idx + 1)
-            results.append(res)
-        return results
+                groups[key]["missing"].append(res["field"])
+
+        # Вычисление и генерация выводов
+        analysis_report = []
+        for (name, condition), data in groups.items():
+            if data["missing"]:
+                analysis_report.append({
+                    "type": "group_error",
+                    "msg": f"⚠️ Группа '{name}': Невозможно проверить условие '{condition}'. Ошибки в полях: {', '.join(data['missing'])}"
+                })
+                continue
+
+            # Парсинг условия: (SUM|AVG)([<=>!]+)(\d+)
+            m = re.match(r"(SUM|AVG)([<=>!]+)(\d+(\.\d+)?)", condition.upper().replace(' ', ''))
+            if not m:
+                analysis_report.append({"type": "group_error", "msg": f"❌ Группа '{name}': Некорректный синтаксис условия '{condition}'"})
+                continue
+            
+            op_type, operator, target_str = m.group(1), m.group(2), m.group(3)
+            target = float(target_str)
+            
+            # Вычисления
+            calculated = sum(data["values"])
+            if op_type == "AVG" and data["values"]:
+                calculated /= len(data["values"])
+            
+            # Логическая проверка
+            valid = False
+            if operator == '=': valid = abs(calculated - target) < 0.01
+            elif operator == '>': valid = calculated > target
+            elif operator == '<': valid = calculated < target
+            elif operator == '>=': valid = calculated >= target
+            elif operator == '<=': valid = calculated <= target
+            
+            icon = "✅" if valid else "❌"
+            result_text = "соответствует" if valid else "НЕ соответствует"
+            
+            analysis_report.append({
+                "type": "group_result",
+                "valid": valid,
+                "msg": f"{icon} Группа '{name}': {op_type} = {calculated:.2f}. Это {result_text} условию {condition}."
+            })
+            
+        return analysis_report
 
 # ============================================================
-#  ЧАСТЬ 2: AGENT LAYER (Агент-Инспектор)
+#  SYSTEM: COORDINATOR (Оркестратор)
 # ============================================================
 
-class InspectorAgent:
-    """Агент, который выполняет грязную работу по проверке"""
-    
-    def generate_report(self, template_path: str, document_path: str) -> str:
+class MultiAgentCheckSystem:
+    def __init__(self):
+        self.perceptor = PerceptionAgent()
+        self.schema = SchemaAgent()
+        self.extractor = ExtractionAgent()
+        self.analyst = AnalystAgent()
+
+    def process(self, template_path: str, doc_path: str) -> str:
         try:
-            # 1. Загрузка шаблона
-            tpl = Template.load_from_file(template_path)
+            # 1. Восприятие
+            tpl_paras = self.perceptor.load_content(template_path)
+            doc_paras = self.perceptor.load_content(doc_path)
+
+            # 2. Построение схемы
+            plan = self.schema.parse_template(tpl_paras)
+            if not plan:
+                return "❌ Ошибка: В шаблоне не найдено тегов вида [[name:type]]."
+
+            # 3. Извлечение и первичная проверка
+            results = []
+            cursor = 0
+            # Пропуск пустых строк в начале документа
+            while cursor < len(doc_paras) and not doc_paras[cursor].strip():
+                cursor += 1
             
-            # 2. Загрузка документа
-            doc_paras = DocumentLoader.get_paragraphs(document_path)
-            
-            # 3. Проверка
-            checker = DocumentChecker(tpl)
-            results = checker.check_document(doc_paras)
-            
-            # 4. Генерация текста отчета
-            lines = [f"📄 <b>Отчет проверки</b>", f"Файл: {os.path.basename(document_path)}", ""]
-            
-            errors_count = 0
-            for r in results:
-                icon = "✅"
-                text = f"<b>{r['field']}</b>: {r.get('value', '')}"
+            for item in plan:
+                found, val, idx = self.extractor.find_value(item, doc_paras, cursor)
                 
-                if r['status'] == 'invalid':
-                    icon = "⚠️"
-                    text += f" (ожидался тип {r['expected_type']})"
-                    errors_count += 1
-                elif r['status'] == 'missing':
-                    icon = "❌"
-                    text = f"<b>{r['field']}</b>: Не найдено!"
-                    errors_count += 1
-                elif r['status'] == 'missing_optional':
-                    icon = "ℹ️"
-                    text += " (не найдено, но не обязательно)"
+                res = {
+                    "field": item["name"],
+                    "expected_type": item["type"],
+                    "group_name": item["group_name"],
+                    "group_condition": item["group_condition"],
+                    "value": val,
+                    "optional": item["optional"]
+                }
                 
-                lines.append(f"{icon} {text}")
-            
-            status_summary = "\n\n🟢 <b>Документ прошел проверку</b>" if errors_count == 0 else f"\n\n🔴 <b>Найдено ошибок: {errors_count}</b>"
-            lines.append(status_summary)
-            
-            return "\n".join(lines)
-            
+                if found:
+                    is_valid = self.analyst.validate_type(val, item["type"])
+                    res["status"] = "ok" if is_valid else "type_error"
+                    # Сдвигаем курсор, но не слишком агрессивно, если это таблица
+                    cursor = max(cursor, idx) 
+                else:
+                    res["status"] = "missing_optional" if item["optional"] else "missing"
+                
+                results.append(res)
+
+            # 4. Интеллектуальный анализ (Группы и математика)
+            group_analysis = self.analyst.analyze_groups(results)
+
+            # 5. Генерация отчета
+            return self._generate_human_report(doc_path, results, group_analysis)
+
         except Exception as e:
-            logging.error(e, exc_info=True)
-            return f"🔥 <b>Критическая ошибка при проверке:</b>\n{str(e)}"
+            logging.error(f"System Error: {e}", exc_info=True)
+            return f"🔥 Критическая ошибка системы: {str(e)}"
+
+    def _generate_human_report(self, doc_name, results, group_analysis):
+        lines = [f"🤖 <b>Результаты проверки</b>", f"📄 Файл: {os.path.basename(doc_name)}", ""]
+        
+        lines.append("<b>1. Проверка полей:</b>")
+        for r in results:
+            if r["status"] == "ok":
+                lines.append(f"✅ <b>{r['field']}</b>: {r['value']}")
+            elif r["status"] == "type_error":
+                lines.append(f"⚠️ <b>{r['field']}</b>: '{r['value']}' (Неверный тип, жду {r['expected_type']})")
+            elif r["status"] == "missing":
+                lines.append(f"❌ <b>{r['field']}</b>: Не найдено")
+            elif r["status"] == "missing_optional":
+                lines.append(f"ℹ️ {r['field']}: пропущено (необяз.)")
+
+        if group_analysis:
+            lines.append("\n<b>2. Логический анализ:</b>")
+            for ga in group_analysis:
+                lines.append(ga["msg"])
+        
+        return "\n".join(lines)
 
 # ============================================================
-#  ЧАСТЬ 3: ORCHESTRATOR (Telegram Bot)
+#  TELEGRAM BOT LOGIC
 # ============================================================
 
-BOT_TOKEN = "8124707173:AAEUWIG6cU8ErdX_ItQZdbWNGD3JRLwjjNo"  # <--- ВСТАВИТЬ ТОКЕН
+BOT_TOKEN = "8124707173:AAEUWIG6cU8ErdX_ItQZdbWNGD3JRLwjjNo" # <-- Вставьте токен
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
-
-# Инициализация
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-inspector = InspectorAgent()
+system = MultiAgentCheckSystem()
 
-# FSM Состояния
+TEMP_DIR = "temp_files"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 class Workflow(StatesGroup):
     waiting_for_template = State()
     waiting_for_document = State()
 
-# Папка для временных файлов
-TEMP_DIR = "temp_files"
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-# --- Хендлеры ---
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await message.answer(
-        "👋 Привет! Я бот-контролер.\n\n"
-        "Я работаю в режиме диалога:\n"
-        "1. Сначала пришлите мне <b>ШАБЛОН</b> (.docx/.pdf) с тегами `[[field:type]]`\n"
-        "2. Затем пришлите заполненный <b>ДОКУМЕНТ</b> для проверки.",
+        "👋 Привет! Я <b>САПСР</b>.\n\n"
+        "Пришлите <b>ШАБЛОН</b> в формате docx/pdf\n",
         parse_mode="HTML"
     )
     await state.set_state(Workflow.waiting_for_template)
 
 @dp.message(Workflow.waiting_for_template, F.document)
 async def process_template(message: types.Message, state: FSMContext):
-    file_id = message.document.file_id
     file_name = message.document.file_name
-    
     if not (file_name.endswith('.docx') or file_name.endswith('.pdf')):
         await message.answer("❌ Поддерживаются только .docx и .pdf файлы.")
         return
 
-    # Скачиваем шаблон
-    file = await bot.get_file(file_id)
+    file = await bot.get_file(message.document.file_id)
     local_path = os.path.join(TEMP_DIR, f"tpl_{message.from_user.id}_{file_name}")
     await bot.download_file(file.file_path, local_path)
     
-    # Сохраняем путь в контексте
     await state.update_data(template_path=local_path)
-    
-    await message.answer(f"✅ Шаблон <b>{file_name}</b> принят.\nТеперь пришлите документ для проверки.", parse_mode="HTML")
+    await message.answer(f"✅ Шаблон <b>{file_name}</b> загружен. \nЖду документ для проверки.", parse_mode="HTML")
     await state.set_state(Workflow.waiting_for_document)
 
 @dp.message(Workflow.waiting_for_document, F.document)
 async def process_document(message: types.Message, state: FSMContext):
     data = await state.get_data()
     template_path = data.get("template_path")
+    if not template_path:
+        await message.answer("⚠️ Шаблон потерян. Начните с /start")
+        return
+
+    msg = await message.answer("⏳ Агенты обрабатывают данные...")
     
     file_name = message.document.file_name
-    
-    msg = await message.answer("⏳ Агент-инспектор изучает документ...")
-    
-    # Скачиваем документ
     file = await bot.get_file(message.document.file_id)
     doc_path = os.path.join(TEMP_DIR, f"doc_{message.from_user.id}_{file_name}")
     await bot.download_file(file.file_path, doc_path)
     
-    # ЗАПУСК АГЕНТА (в отдельном потоке, чтобы не блочить бота)
-    report = await asyncio.to_thread(inspector.generate_report, template_path, doc_path)
+    # Запуск системы в отдельном потоке
+    report = await asyncio.to_thread(system.process, template_path, doc_path)
     
-    await msg.edit_text(report, parse_mode="HTML")
+    # Разбивка на части, если сообщение слишком длинное для Telegram (4096 символов)
+    if len(report) > 4000:
+        for x in range(0, len(report), 4000):
+            await message.answer(report[x:x+4000], parse_mode="HTML")
+    else:
+        await msg.edit_text(report, parse_mode="HTML")
     
-    # Очистка и сброс
-    # (Опционально можно удалять файлы тут)
-    await message.answer("Можете прислать следующий документ для проверки по этому же шаблону или нажмите /start для нового шаблона.")
+    await message.answer("Можете прислать следующий документ или /start для смены шаблона.")
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Действие отменено. Жмите /start")
-
-# --- Запуск ---
+    await message.answer("Сброс выполнен. Жмите /start")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
