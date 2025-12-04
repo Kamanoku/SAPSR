@@ -354,50 +354,71 @@ class DocumentChecker:
             # Для числовых полей возвращаем True, т.к. извлечение числа происходит отдельно
             return True
 
-        # --- НОВАЯ ЛОГИКА ДЛЯ ЧИСЛОВЫХ ПОЛЕЙ (ПРИОРИТЕТ SEQUENTIAL) ---
-        if expected_type == 'number':
-            max_forward_search = 10
-            start_pos = start_index
+            # --- НОВАЯ ЛОГИКА ДЛЯ ЧИСЛОВЫХ ПОЛЕЙ ---
+            if expected_type == 'number':
 
-            # Эвристика: если якорь перед полем найден, начинаем с него + 1
-            if pos_before:
-                start_pos = pos_before[0] + 1
+                # ВАРИАНТ 1: Попытка найти число В ТОЙ ЖЕ СТРОКЕ, где найден якорь (anchor_before)
+                # Это решает проблему "Студент гр. 321702"
+                if pos_before:
+                    idx = pos_before[0]
+                    current_para = doc_paragraphs[idx] or ""
 
-            for k in range(start_pos, min(len(doc_paragraphs), start_pos + max_forward_search)):
-                cand_raw = doc_paragraphs[k]
+                    # Ищем позицию якоря, чтобы смотреть текст строго ПОСЛЕ него
+                    # (чтобы случайно не найти цифру внутри самого якоря)
+                    anchor_clean = anchor_before.strip().lower()
+                    para_lower = current_para.lower()
+                    find_idx = para_lower.find(anchor_clean)
 
-                if cand_raw is None or cand_raw.strip() == "":
+                    if find_idx != -1:
+                        # Отрезаем всё, что было до конца якоря
+                        text_after_anchor = current_para[find_idx + len(anchor_clean):]
+                        extracted_number_inline = self._extract_first_number(text_after_anchor)
+
+                        if extracted_number_inline:
+                            return True, extracted_number_inline, idx
+
+                # ВАРИАНТ 2: Поиск в СЛЕДУЮЩИХ строках (Старая логика)
+                # Работает, если число стоит в следующей ячейке таблицы или на новой строке
+                max_forward_search = 10
+                start_pos = start_index
+
+                # Если якорь был найден, начинаем поиск СО СЛЕДУЮЩЕЙ строки (так как текущую уже проверили выше)
+                if pos_before:
+                    start_pos = pos_before[0] + 1
+
+                for k in range(start_pos, min(len(doc_paragraphs), start_pos + max_forward_search)):
+                    cand_raw = doc_paragraphs[k]
+
+                    if cand_raw is None or cand_raw.strip() == "":
+                        continue
+
+                    cand = cand_raw.strip()
+                    cand_lower = cand.lower()
+
+                    # Жесткий стоп на терминаторах
+                    if any(sw in cand_lower for sw in stop_words_list) or re.search(
+                            r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand_lower):
+                        break
+
+                    # Стоп-сигнал: следующий Placeholder
+                    if self._placeholder_pattern.search(cand):
+                        break
+
+                    extracted_number = self._extract_first_number(cand)
+
+                    if extracted_number:
+                        # Нашли число!
+                        if not self._is_anchor_like(extracted_number, [anchor_before, anchor_after]):
+                            return True, extracted_number, k
+
+                    # Если не нашли число и абзац содержит много текста, предполагаем выход из таблицы
+                    if not extracted_number and len(cand) > 30:
+                        break
+
                     continue
 
-                cand = cand_raw.strip()
-                cand_lower = cand.lower()
-
-                # Жесткий стоп на терминаторах
-                if any(sw in cand_lower for sw in stop_words_list) or re.search(
-                        r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand_lower):
-                    break
-
-                # Стоп-сигнал: следующий Placeholder (граница следующего поля)
-                if self._placeholder_pattern.search(cand):
-                    break
-
-                extracted_number = self._extract_first_number(cand)
-
-                if extracted_number:
-                    # Нашли число! Используем его как значение.
-                    # Дополнительная проверка на совпадение с якорем (хотя число вряд ли будет якорем)
-                    if not self._is_anchor_like(extracted_number, [anchor_before, anchor_after]):
-                        return True, extracted_number, k
-
-                # Если не нашли число и абзац содержит много текста, предполагаем выход из таблицы
-                if not extracted_number and len(cand) > 30:
-                    break
-
-                # Продолжаем поиск, если не нашли число, и это короткий не-терминальный текст (разделитель)
-                continue
-
-            # Если мы дошли до конца цикла, то число не найдено
-            return False, None, -1
+                # Если ни один вариант не сработал
+                return False, None, -1
 
         # --- СТАРАЯ ЛОГИКА ДЛЯ НЕЧИСЛОВЫХ ПОЛЕЙ (Остается anchor-based) ---
 
@@ -796,11 +817,26 @@ class AppGUI:
             for i, p in enumerate(tpl.get_placeholders(), 1):
                 group_name = p['group_name'] if p['group_name'] else '—'
                 group_cond = p['group_condition'] if p['group_condition'] else '—'
+
                 info.append(f"{i}. {p['name']} ({p['type']})")
-                info.append(f"   optional: {p['optional']}, group: {group_name}, condition: {group_cond}")
+
+                # --- ИЗМЕНЕНИЕ НАЧАЛО: Скрываем optional: False ---
+                details_parts = []
+                # Добавляем пометку только если optional == True
+                if p['optional']:
+                    details_parts.append("optional: True")
+
+                details_parts.append(f"group: {group_name}")
+                details_parts.append(f"condition: {group_cond}")
+
+                # Собираем строку через запятую
+                info.append(f"   {', '.join(details_parts)}")
+                # --- ИЗМЕНЕНИЕ КОНЕЦ ---
+
                 info.append(f"   anchor_before: '{p['anchor_before']}'")
                 info.append(f"   anchor_after : '{p['anchor_after']}'")
                 info.append(f"   para_index: {p['para_index']}\n")
+
             self.template_label.config(text=f"Шаблон: {os.path.basename(path)} — {len(tpl.get_placeholders())} полей")
             self.result_text.delete(1.0, tk.END)
             self.result_text.insert(tk.END, "\n".join(info))
