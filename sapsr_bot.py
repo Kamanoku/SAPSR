@@ -16,11 +16,6 @@ from aiogram.fsm.state import State, StatesGroup
 import docx
 import PyPDF2
 
-
-# ============================================================
-#  CORE LOGIC (PORTED FROM KRS.PY)
-# ============================================================
-
 class DocumentLoader:
     """Загружает текст и параграфы из .docx и .pdf файлов."""
 
@@ -570,10 +565,6 @@ class DocumentChecker:
         return "\n".join(lines)
 
 
-# ============================================================
-#  SYSTEM WRAPPER
-# ============================================================
-
 class MultiAgentCheckSystem:
     def process(self, template_path: str, doc_path: str) -> str:
         try:
@@ -586,14 +577,10 @@ class MultiAgentCheckSystem:
 
         except Exception as e:
             logging.error(f"Error: {e}", exc_info=True)
-            return f"🔥 Критическая ошибка: {str(e)}"
+            return f"Критическая ошибка: {str(e)}"
 
 
-# ============================================================
-#  TELEGRAM BOT LOGIC
-# ============================================================
-
-BOT_TOKEN = "8124707173:AAEUWIG6cU8ErdX_ItQZdbWNGD3JRLwjjNo"  # <-- Вставьте токен
+BOT_TOKEN = "8124707173:AAEUWIG6cU8ErdX_ItQZdbWNGD3JRLwjjNo"  
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
