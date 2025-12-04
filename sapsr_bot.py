@@ -16,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 import docx
 import PyPDF2
 
+
 # ============================================================
 #  CORE LOGIC (PORTED FROM KRS.PY)
 # ============================================================
@@ -27,7 +28,6 @@ class DocumentLoader:
     def _normalize_text(s: str) -> str:
         if s is None:
             return ""
-        # Удаляем лишние символы, сжимаем пробелы и удаляем переводы строк/табуляцию
         s = s.replace("\u00A0", " ").replace("\u200B", "").replace("\uFEFF", "")
         s = s.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
         s = re.sub(r"[ \t\v\f\u00A0]+", " ", s)
@@ -80,9 +80,7 @@ class DocumentLoader:
                 page_text = page.extract_text() or ""
                 for ln in page_text.splitlines():
                     ln_norm = DocumentLoader._normalize_text(ln)
-
                     if ln_norm == "" and not preserve_empty: continue
-
                     if dedupe:
                         if ln_norm:
                             if ln_norm not in seen:
@@ -134,7 +132,6 @@ class Template:
     @staticmethod
     def extract_placeholders_from_paragraphs(paragraphs: list) -> list:
         placeholders = []
-        # Regex теперь допускает пробелы внутри тега
         inline_pattern = re.compile(
             r"\[\[\s*([^:\]\n]+?)\s*:\s*([^,:]\s*[^,\]\n]+?)"
             r"(?:\s*:\s*([^:\]\n]+?)\s*:\s*([^,\]\n]+?))?"
@@ -169,7 +166,7 @@ class Template:
 
                 optional_flag = bool(optional_flag)
 
-                # ---------------- anchor_before ----------------
+                # anchor_before
                 left_part = para[: m.start()].strip()
                 if left_part:
                     anchor_before = left_part
@@ -184,7 +181,7 @@ class Template:
                             anchor_before = prev_para
                             break
 
-                # ---------------- anchor_after ----------------
+                # anchor_after
                 right_part = para[m.end():].strip()
                 if right_part:
                     anchor_after = right_part
@@ -357,7 +354,6 @@ class DocumentChecker:
                 continue
             return False, None, -1
 
-        # Logic for non-numeric fields
         if pos_before and pos_after:
             best = None
             best_dist = None
@@ -430,7 +426,7 @@ class DocumentChecker:
         condition = condition.strip().upper().replace(' ', '')
         m = re.match(r"(SUM|AVG)([<=>!]+)(\d+(\.\d+)?)", condition)
         if not m: return False, f"Условие '{condition}' не распознано."
-        
+
         check_type, operator, target_str = m.group(1), m.group(2), m.group(3)
         target = float(target_str)
         value_to_check = sum_val
@@ -442,16 +438,22 @@ class DocumentChecker:
 
         tolerance = 0.001
         is_valid = False
-        if operator == '=': is_valid = abs(value_to_check - target) < tolerance
-        elif operator == '>=': is_valid = value_to_check >= target
-        elif operator == '<=': is_valid = value_to_check <= target
-        elif operator == '>': is_valid = value_to_check > target
-        elif operator == '<': is_valid = value_to_check < target
-        elif operator == '!=': is_valid = abs(value_to_check - target) >= tolerance
-        
+        if operator == '=':
+            is_valid = abs(value_to_check - target) < tolerance
+        elif operator == '>=':
+            is_valid = value_to_check >= target
+        elif operator == '<=':
+            is_valid = value_to_check <= target
+        elif operator == '>':
+            is_valid = value_to_check > target
+        elif operator == '<':
+            is_valid = value_to_check < target
+        elif operator == '!=':
+            is_valid = abs(value_to_check - target) >= tolerance
+
         result_val_str = f"{value_to_check:.2f}"
         msg = f"{check_name} ({result_val_str}) соответствует условию {check_type}{operator}{target}." if is_valid else \
-              f"{check_name} ({result_val_str}) не соответствует условию {check_type}{operator}{target}."
+            f"{check_name} ({result_val_str}) не соответствует условию {check_type}{operator}{target}."
         return is_valid, msg
 
     def _check_groups(self, results: list) -> list:
@@ -482,13 +484,14 @@ class DocumentChecker:
         group_report = []
         for (group_name, condition), data in groups_to_check.items():
             if data["all_ok"]:
-                is_valid, message = self._evaluate_group_condition(condition, data["total_sum"], len(data["valid_values"]))
+                is_valid, message = self._evaluate_group_condition(condition, data["total_sum"],
+                                                                   len(data["valid_values"]))
                 status = "group_ok" if is_valid else "group_condition_invalid"
             else:
                 status = "group_check_failed"
                 missing = ", ".join(data['missing_fields'])
                 message = f"Ошибки в полях: {missing}."
-            
+
             group_report.append({
                 "field": f"Группа: {group_name}", "status": status,
                 "value": f"{data['total_sum']:.2f}", "group_name": group_name,
@@ -529,23 +532,33 @@ class DocumentChecker:
 
         return results + self._check_groups(results)
 
+    # -------------------------------------------------------------
+    # ИЗМЕНЕННЫЙ МЕТОД: Добавлено отображение группы рядом с именем
+    # -------------------------------------------------------------
     def generate_report(self, file_name: str, results: list) -> str:
         lines = [f"📄 Файл: {file_name}", ""]
         group_reports = []
-        
+
         for r in results:
+            # Отделяем отчеты о группах в отдельный список
             if r["field"].startswith("Группа:"):
                 group_reports.append(r)
                 continue
-            
+
+            # --- ИЗМЕНЕНИЕ: Формируем строку с названием группы ---
+            group_info = ""
+            if r.get("group_name"):
+                group_info = f" <i>(Группа: {r['group_name']})</i>"
+            # -----------------------------------------------------
+
             if r["status"] == "ok":
-                lines.append(f"✅ <b>{r['field']}</b>: {r['value']}")
+                lines.append(f"✅ <b>{r['field']}</b>{group_info}: {r['value']}")
             elif r["status"] == "invalid":
-                lines.append(f"⚠️ <b>{r['field']}</b>: '{r['value']}' (Тип не {r['expected_type']})")
+                lines.append(f"⚠️ <b>{r['field']}</b>{group_info}: '{r['value']}' (Тип не {r['expected_type']})")
             elif r["status"] == "missing_optional":
-                lines.append(f"ℹ️ {r['field']}: пропущено (необяз.)")
+                lines.append(f"ℹ️ {r['field']}{group_info}: пропущено (необяз.)")
             elif r["status"] == "missing":
-                lines.append(f"❌ <b>{r['field']}</b>: Не найдено")
+                lines.append(f"❌ <b>{r['field']}</b>{group_info}: Не найдено")
 
         if group_reports:
             lines.append("\n<b>Группы и формулы:</b>")
@@ -556,6 +569,7 @@ class DocumentChecker:
 
         return "\n".join(lines)
 
+
 # ============================================================
 #  SYSTEM WRAPPER
 # ============================================================
@@ -563,10 +577,9 @@ class DocumentChecker:
 class MultiAgentCheckSystem:
     def process(self, template_path: str, doc_path: str) -> str:
         try:
-            # Используем надежную логику загрузки из krs.py
             tpl = Template.load_from_file(template_path)
             doc_paras = DocumentLoader.get_paragraphs(doc_path)
-            
+
             checker = DocumentChecker(tpl)
             results = checker.check_document(doc_paras)
             return checker.generate_report(os.path.basename(doc_path), results)
@@ -575,11 +588,12 @@ class MultiAgentCheckSystem:
             logging.error(f"Error: {e}", exc_info=True)
             return f"🔥 Критическая ошибка: {str(e)}"
 
+
 # ============================================================
 #  TELEGRAM BOT LOGIC
 # ============================================================
 
-BOT_TOKEN = "8124707173:AAEUWIG6cU8ErdX_ItQZdbWNGD3JRLwjjNo" # <-- Вставьте токен
+BOT_TOKEN = "8124707173:AAEUWIG6cU8ErdX_ItQZdbWNGD3JRLwjjNo"  # <-- Вставьте токен
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -589,9 +603,11 @@ system = MultiAgentCheckSystem()
 TEMP_DIR = "temp_files"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+
 class Workflow(StatesGroup):
     waiting_for_template = State()
     waiting_for_document = State()
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -601,6 +617,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
     await state.set_state(Workflow.waiting_for_template)
+
 
 @dp.message(Workflow.waiting_for_template, F.document)
 async def process_template(message: types.Message, state: FSMContext):
@@ -612,10 +629,11 @@ async def process_template(message: types.Message, state: FSMContext):
     file = await bot.get_file(message.document.file_id)
     local_path = os.path.join(TEMP_DIR, f"tpl_{message.from_user.id}_{file_name}")
     await bot.download_file(file.file_path, local_path)
-    
+
     await state.update_data(template_path=local_path)
     await message.answer(f"✅ Шаблон <b>{file_name}</b> загружен. \nЖду документ для проверки.", parse_mode="HTML")
     await state.set_state(Workflow.waiting_for_document)
+
 
 @dp.message(Workflow.waiting_for_document, F.document)
 async def process_document(message: types.Message, state: FSMContext):
@@ -626,31 +644,34 @@ async def process_document(message: types.Message, state: FSMContext):
         return
 
     msg = await message.answer("⏳ Обработка данных...")
-    
+
     file_name = message.document.file_name
     file = await bot.get_file(message.document.file_id)
     doc_path = os.path.join(TEMP_DIR, f"doc_{message.from_user.id}_{file_name}")
     await bot.download_file(file.file_path, doc_path)
-    
+
     # Запуск логики проверки в потоке (так как parsing может быть тяжелым)
     report = await asyncio.to_thread(system.process, template_path, doc_path)
-    
+
     if len(report) > 4000:
         for x in range(0, len(report), 4000):
-            await message.answer(report[x:x+4000], parse_mode="HTML")
+            await message.answer(report[x:x + 4000], parse_mode="HTML")
     else:
         await msg.edit_text(report, parse_mode="HTML")
-    
+
     await message.answer("Можете прислать следующий документ или /start для смены шаблона.")
+
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Сброс выполнен. Жмите /start")
 
+
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     try:
