@@ -415,7 +415,6 @@ class DocumentChecker:
         # 2. Поиск по одному якорю (anchor_before)
         if pos_before:
             for b in pos_before:
-                # 2.1 Поиск на той же строке
                 para_b = doc_paragraphs[b] or ""
                 low_b = para_b.lower()
                 ab = anchor_before.strip().lower()
@@ -425,7 +424,6 @@ class DocumentChecker:
                     if candidate_ok(after_b, [anchor_before, anchor_after]):
                         return True, after_b, b
 
-                # 2.2 Поиск в последующих строках
                 max_forward_search = 10
                 for k in range(b + 1, min(len(doc_paragraphs), b + 1 + max_forward_search)):
                     cand_raw = doc_paragraphs[k]
@@ -436,20 +434,13 @@ class DocumentChecker:
                     cand = cand_raw.strip()
                     cand_lower = cand.lower()
 
-                    # ------------------------------------------------------------
-                    # Логика для нечисловых полей:
-                    # ------------------------------------------------------------
-
-                    # 1. Жесткий стоп на терминаторах документа/подписях
                     if any(sw in cand_lower for sw in ["введение", "заключение", "список", "приложение"]) or re.search(
                             r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand_lower):
                         break
 
-                    # 2. Если найдено подходящее значение, возвращаем его.
                     if candidate_ok(cand, [anchor_before, anchor_after]):
                         return True, cand, k
 
-                    # 3. Во всех остальных случаях: прерываем поиск.
                     break
 
         # 3. Поиск по одному якорю (anchor_after)
@@ -477,8 +468,7 @@ class DocumentChecker:
 
         return False, None, -1
 
-    # ------------------------------------------------------------
-    # ✨ Оценка произвольного условия
+    # Оценка произвольного условия
     def _evaluate_group_condition(self, condition: str, sum_val: float, num_values: int) -> tuple:
         """Выполняет проверку группового условия (SUM, AVG) с операторами."""
         if not condition:
@@ -531,8 +521,7 @@ class DocumentChecker:
 
         return is_valid, message
 
-    # ------------------------------------------------------------
-    # ✨ МЕТОД ДЛЯ ГРУПП
+    # МЕТОД ДЛЯ ГРУПП
     def _check_groups(self, results: list) -> list:
         """Проверяет групповые условия, используя произвольные условия из шаблона."""
 
@@ -670,8 +659,7 @@ class DocumentChecker:
 
         return results + group_results
 
-    # ------------------------------------------------------------
-    # ✨ Генерирование отчета
+    # Генерирование отчета
     def generate_report(self, file_name: str, results: list) -> str:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         header = (
@@ -785,7 +773,6 @@ class AppGUI:
 
                 info.append(f"{i}. {p['name']} ({p['type']})")
 
-                # --- ИЗМЕНЕНИЕ НАЧАЛО: Скрываем optional: False ---
                 details_parts = []
                 # Добавляем пометку только если optional == True
                 if p['optional']:
@@ -796,7 +783,6 @@ class AppGUI:
 
                 # Собираем строку через запятую
                 info.append(f"   {', '.join(details_parts)}")
-                # --- ИЗМЕНЕНИЕ КОНЕЦ ---
 
                 info.append(f"   anchor_before: '{p['anchor_before']}'")
                 info.append(f"   anchor_after : '{p['anchor_after']}'")
@@ -858,4 +844,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
