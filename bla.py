@@ -8,9 +8,7 @@ import re
 from datetime import datetime
 
 
-# ============================================================
-#  DocumentLoader (МОДИФИЦИРОВАН)
-# ============================================================
+
 class DocumentLoader:
     """Загружает текст и параграфы из .docx и .pdf файлов."""
 
@@ -18,9 +16,7 @@ class DocumentLoader:
     def _normalize_text(s: str) -> str:
         if s is None:
             return ""
-        # Удаляем лишние символы, сжимаем пробелы и удаляем переводы строк/табуляцию
         s = s.replace("\u00A0", " ").replace("\u200B", "").replace("\uFEFF", "")
-        # ИСПРАВЛЕНИЕ: Удаление символов перевода строки и табуляции
         s = s.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
         s = re.sub(r"[ \t\v\f\u00A0]+", " ", s)
         return s.strip()
@@ -102,10 +98,6 @@ class DocumentLoader:
         else:
             raise ValueError("Поддерживаются только .docx и .pdf")
 
-
-# ============================================================
-#  Template
-# ============================================================
 class Template:
     """Хранит список placeholders и их anchors."""
 
@@ -234,8 +226,7 @@ class Template:
             if key not in seen:
                 seen.add(key)
                 unique.append(p)
-
-        # маркер "следующий placeholder подряд"
+                
         for i in range(len(unique) - 1):
             unique[i]["next_is_placeholder"] = unique[i + 1]["para_index"] - unique[i]["para_index"] <= 1
 
@@ -256,19 +247,12 @@ class Template:
             raise ValueError("В шаблоне не найдено ни одного заполнителя [[...]]")
         return cls(placeholders=placeholders, source_path=path)
 
-
-# ============================================================
-#  DocumentChecker (МОДИФИЦИРОВАН)
-# ============================================================
 class DocumentChecker:
     """Проверяет документ по anchors и выполняет групповые проверки."""
 
     def __init__(self, template: Template):
         self.template = template
-        # Компилируем шаблон для поиска Placeholder как стоп-сигнала
         self._placeholder_pattern = re.compile(r"\[\[.*?\]\]")
-
-        # НОВЫЙ МЕТОД: Извлечение первого числа
 
     @staticmethod
     def _extract_first_number(value: str) -> str | None:
@@ -287,7 +271,6 @@ class DocumentChecker:
         if not value: return False
         v = value.strip()
         if expected_type == "string": return bool(re.search(r"[A-Za-zА-Яа-яЁё]", v))
-        # Проверка для числовых полей теперь строгая (только число в абзаце)
         if expected_type == "number": return bool(
             re.fullmatch(r"[+-]?\s*\d+([.,]\d+)?", v.replace(' ', '')))
         if expected_type == "date": return bool(
@@ -316,15 +299,12 @@ class DocumentChecker:
 
         def find_positions(anchor):
             if not anchor: return []
-            # Упрощаем якорь для поиска (удаляем кавычки, сжимаем пробелы)
             a_norm = re.sub(r'["\s]+', ' ', anchor.strip()).lower()
             pos = []
             for i in range(start_index, len(doc_paragraphs)):
                 para = doc_paragraphs[i]
                 if para is None: continue
 
-                # Добавляем разделители для поиска в таблицах:
-                # Ищем якорь как отдельное слово/ячейку в извлеченном тексте
                 para_norm_cells = re.sub(r"[,;]+", "|", para.strip()).lower()
                 para_norm_text = re.sub(r"\s+", " ", para.strip()).lower()
 
@@ -354,35 +334,25 @@ class DocumentChecker:
             # Для числовых полей возвращаем True, т.к. извлечение числа происходит отдельно
             return True
 
-            # --- НОВАЯ ЛОГИКА ДЛЯ ЧИСЛОВЫХ ПОЛЕЙ ---
             if expected_type == 'number':
-
-                # ВАРИАНТ 1: Попытка найти число В ТОЙ ЖЕ СТРОКЕ, где найден якорь (anchor_before)
-                # Это решает проблему "Студент гр. 321702"
+                
                 if pos_before:
                     idx = pos_before[0]
                     current_para = doc_paragraphs[idx] or ""
-
-                    # Ищем позицию якоря, чтобы смотреть текст строго ПОСЛЕ него
-                    # (чтобы случайно не найти цифру внутри самого якоря)
                     anchor_clean = anchor_before.strip().lower()
                     para_lower = current_para.lower()
                     find_idx = para_lower.find(anchor_clean)
 
                     if find_idx != -1:
-                        # Отрезаем всё, что было до конца якоря
                         text_after_anchor = current_para[find_idx + len(anchor_clean):]
                         extracted_number_inline = self._extract_first_number(text_after_anchor)
 
                         if extracted_number_inline:
                             return True, extracted_number_inline, idx
 
-                # ВАРИАНТ 2: Поиск в СЛЕДУЮЩИХ строках (Старая логика)
-                # Работает, если число стоит в следующей ячейке таблицы или на новой строке
                 max_forward_search = 10
                 start_pos = start_index
 
-                # Если якорь был найден, начинаем поиск СО СЛЕДУЮЩЕЙ строки (так как текущую уже проверили выше)
                 if pos_before:
                     start_pos = pos_before[0] + 1
 
@@ -395,19 +365,16 @@ class DocumentChecker:
                     cand = cand_raw.strip()
                     cand_lower = cand.lower()
 
-                    # Жесткий стоп на терминаторах
                     if any(sw in cand_lower for sw in stop_words_list) or re.search(
                             r"^\(?\s*(подпись|иниц|инициалы|фамил)", cand_lower):
                         break
 
-                    # Стоп-сигнал: следующий Placeholder
                     if self._placeholder_pattern.search(cand):
                         break
 
                     extracted_number = self._extract_first_number(cand)
 
                     if extracted_number:
-                        # Нашли число!
                         if not self._is_anchor_like(extracted_number, [anchor_before, anchor_after]):
                             return True, extracted_number, k
 
@@ -417,10 +384,8 @@ class DocumentChecker:
 
                     continue
 
-                # Если ни один вариант не сработал
                 return False, None, -1
 
-        # --- СТАРАЯ ЛОГИКА ДЛЯ НЕЧИСЛОВЫХ ПОЛЕЙ (Остается anchor-based) ---
 
         # 1. Поиск по двум якорям
         if pos_before and pos_after:
@@ -893,3 +858,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
